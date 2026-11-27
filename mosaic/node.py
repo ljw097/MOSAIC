@@ -215,6 +215,9 @@ class Node:
         elif r.flag == S.DELIVER_EXIT and self.exit_service is not None:
             self.stats["delivered"] += 1
             self.exit_service.on_payload(p.payload)
+        elif r.flag == S.DELIVER_ENDPOINT and self.exit_service is not None:
+            self.stats["delivered"] += 1
+            self.exit_service.on_endpoint_payload(p.payload)
         elif r.flag == S.DELIVER_MAILBOX and self.role == "gateway":
             if r.target not in self.mailboxes and len(self.mailboxes) >= MAX_MAILBOXES:
                 self.stats["dropped"] += 1

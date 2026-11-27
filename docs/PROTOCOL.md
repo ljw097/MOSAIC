@@ -58,6 +58,7 @@ k_ir ‖ k_ri ‖ k_c = HKDF(DH(e_I,S_R) ‖ ss_kem ‖ DH(e_I,e_R), "MOSAIC lin
 | 2 DELIVER | 게이트웨이 → 클라이언트: `surb_id(8) ‖ payload(2048)` |
 | 3 REGISTER | 클라이언트 → 게이트웨이: `mailbox_id(16)` |
 | 4 DUMMY | 커버 |
+| 6 ENDPOINT_FRAG | 출구 → 엔드포인트 입구: 조각 하나 |
 | 5 FORWARD | 클라이언트/서비스 → 게이트웨이: `target(16) ‖ packet` (SURB 응답 대리 전송) |
 
 ## 4. 마름모 분할 계층 (SSMS)
@@ -110,10 +111,27 @@ FRAGMENT (Sphinx 본문, ≤2032B) = 0xF5 ‖ msg_id(16) ‖ idx(1) ‖ k(1) ‖
 - 응답: 서비스는 SURB 패킷을 자기 게이트웨이로 보낸다 (링크 프레임 `F_FORWARD = target(16) ‖ packet`).
   게이트웨이가 대신 첫 홉에 전달하므로 믹스는 서비스 IP를 알 수 없다.
 
+## 6b. 다중 입구 엔드포인트 (공개 서버)
+
+- 기술자 `{domain, host, ports[], identity_pk, x25519_pk, mlkem_pk (E2E), link_fp, published}`를 Ed25519로 서명한다.
+  `link_fp = H("MOSAIC link bundle", link_x25519_pk, link_mlkem_pk)`.
+- 발견: HTTPS 응답 헤더 `Mosaic-Endpoint`가 있으면 `https://<domain>/.well-known/mosaic.json`을 HTTPS로 받는다.
+  `domain` 일치와 서명을 확인한다. 도메인 ↔ 키 결합은 도메인의 TLS 인증서가 보증한다.
+- 정방향: 메시지마다 출구를 섞은 목록에서 조각 i를 출구 `X_i`로, 입구 포트 `ports[i mod m]`로 보낸다.
+  Sphinx 최종 지시는 `DELIVER_ENDPOINT(0x05)`이고, 본문은 다음과 같다.
+  ```
+  0xED ‖ port(2) ‖ hlen(1) ‖ host ‖ link_fp(32) ‖ FRAGMENT
+  ```
+  조각 용량은 `1976 − (36 + |host|)`로 줄어든다.
+- 출구 → 입구 링크: 응답자가 먼저 정적 공개키 묶음(32+1184B)을 보낸다. 출구는 `link_fp`로 검증한 뒤 일반
+  하이브리드 핸드셰이크를 한다. 프레임 `F_ENDPOINT_FRAG(6)`로 조각 하나를 넘긴다. 출구 정책(사설 주소, 포트)은 그대로 적용된다.
+- 서버는 조각을 모아 SSMS를 풀고, E2E(§6과 같은 INIT/UP/DOWN)를 연 뒤 가상 포트별 백엔드로 연결한다.
+- 응답: 서버는 SURB 패킷을 연결된 출구 링크들에 라운드로빈으로 `F_FORWARD`로 실어 보낸다. 출구가 첫 홉에 전달한다.
+
 ## 7. 브라우저 HTTPS 전용 정책
 
 일반 인터넷은 `https://`만 쓴다. 평문 `http://`는 확인 페이지를 거쳐야 하고(`ok=1`), HTTPS→HTTP 리다이렉트와
-HTTP 하위 리소스는 차단한다. `.mosaic`은 E2E 터널 안이므로 `http://`를 허용한다.
+HTTP 하위 리소스는 차단한다. `.mosaic`과 등록된 다중 입구 엔드포인트 도메인은 E2E 터널 안이므로 `http://`를 허용한다.
 
 ## 8. 트래픽 스케줄링
 

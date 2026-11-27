@@ -34,6 +34,7 @@ RELAY = 0x01          # 다음 노드로 지연 후 전달
 DELIVER_EXIT = 0x02   # 이 노드(출구)가 최종 수신자
 DELIVER_MAILBOX = 0x03  # 이 노드(게이트웨이)가 클라이언트 우편함으로 전달
 FINAL_DROP = 0x04     # 커버(루프) 트래픽: 폐기
+DELIVER_ENDPOINT = 0x05  # 이 노드(출구)가 페이로드의 조각을 MOSAIC 엔드포인트의 입구 포트로 전달
 
 
 class SphinxError(Exception):

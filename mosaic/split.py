@@ -110,9 +110,9 @@ MAX_N = 16
 _AD = b"MOSAIC-split-v1"
 
 
-def max_message(k: int) -> int:
-    """k개 조각으로 실어 나를 수 있는 최대 평문 길이."""
-    return k * FRAG_CAP - TAG_LEN
+def max_message(k: int, cap: int = FRAG_CAP) -> int:
+    """k개 조각으로 실어 나를 수 있는 최대 평문 길이. cap = 조각 하나의 piece 용량."""
+    return k * cap - TAG_LEN
 
 
 @dataclass
@@ -139,10 +139,10 @@ def parse(body: bytes) -> Fragment | None:
     return Fragment(mid, idx, k, n, total, ks, body[FRAG_HDR.size: FRAG_HDR.size + plen])
 
 
-def split(msg: bytes, k: int, n: int, msg_id: bytes | None = None) -> list[Fragment]:
+def split(msg: bytes, k: int, n: int, msg_id: bytes | None = None, cap: int = FRAG_CAP) -> list[Fragment]:
     if not 1 <= k <= n <= MAX_N:
         raise ValueError("need 1 <= k <= n <= 16")
-    if len(msg) > max_message(k):
+    if len(msg) > max_message(k, min(cap, FRAG_CAP)):
         raise ValueError("message too large for k")
     key = os.urandom(32)
     ct = ChaCha20Poly1305(key).encrypt(b"\0" * 12, msg, _AD)    # 키는 메시지마다 새로 → 고정 nonce 안전

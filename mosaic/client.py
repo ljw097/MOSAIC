@@ -91,6 +91,17 @@ class ServiceDest:
     intros: list[tuple[Descriptor, bytes]]
 
 
+@dataclass
+class EndpointDest:
+    """다중 입구 엔드포인트. 조각 i → 출구 X_i → 서버 입구 포트 i. 서버가 직접 모은다."""
+    desc: "EndpointDescriptor"
+
+    @property
+    def cap(self) -> int:
+        from .endpoint import piece_cap
+        return piece_cap(self.desc.host)
+
+
 class Lane:
     """게이트웨이 하나와의 링크. 자기만의 우편함 id, 송신 큐, Poisson 과정을 가진다."""
 
@@ -107,6 +118,7 @@ class MStream:
         self.c, self.dest, self.sid = client, dest, sid
         self.e2e = e2e
         self.overhead = E.OVERHEAD if e2e else 0
+        self.cap = dest.cap if isinstance(dest, EndpointDest) else P.FRAG_CAP
         self.up_seq = 0
         self.down_next = 0
         self.down_pending: dict[int, K.Cell] = {}
@@ -126,7 +138,7 @@ class MStream:
 
     @property
     def max_data(self) -> int:
-        return self.c.profile.max_cell_data - self.overhead
+        return P.max_message(self.c.profile.split_k[0], self.cap) - K.HDR.size - self.overhead
 
     def _supply_surbs(self, nsets: int):
         prof = self.c.profile
@@ -202,6 +214,7 @@ class MosaicClient:
         self.ready = asyncio.Event()
         self.path_log: list[list[list[bytes]]] | None = None     # 테스트/진단용
         self.on_forward = None          # 서비스 호스트가 설정: 정방향 조각 처리기
+        self.endpoints: dict[str, "EndpointDescriptor"] = {}     # 도메인 → 다중 입구 엔드포인트
         self.stats = {"sent_real": 0, "sent_cover": 0, "sent_loop": 0, "loops_back": 0,
                       "recv_real": 0, "recv_dummy": 0, "loop_rtt_ms": 0.0,
                       "messages_split": 0, "fragments_sent": 0, "messages_reassembled": 0}
@@ -312,15 +325,27 @@ class MosaicClient:
         게이트웨이들로 나뉘어 들어가고 서비스 자신이 모은다 (출구 없음)."""
         p = self.profile
         k = random.randint(*p.split_k)
-        k = max(k, -(-(len(msg) + P.TAG_LEN) // P.FRAG_CAP))      # 너무 크면 k를 키운다
+        cap = dest.cap if isinstance(dest, EndpointDest) else P.FRAG_CAP
+        k = max(k, -(-(len(msg) + P.TAG_LEN) // cap))      # 너무 크면 k를 키운다
         n = min(P.MAX_N, k + random.randint(*p.split_extra))
-        frags = P.split(msg, k, n)
+        frags = P.split(msg, k, n, cap=cap)
         paths = disjoint_paths(self.consensus, n)
         lanes = self._lanes_for(n)
-        if self.path_log is not None:
-            self.path_log.append([[l.gateway.node_id] + [m.node_id for m in mp] for l, mp in zip(lanes, paths)])
+        finals: list[bytes] = []
+        if isinstance(dest, EndpointDest):
+            # 오른쪽 꼭짓점을 출구가 아니라 서버로: 조각마다 서로 다른 출구와 서로 다른 입구 포트
+            exits = self.consensus.by_role("exit")
+            random.shuffle(exits)
+            ex_for = [exits[i % len(exits)] for i in range(n)]
         for i, (frag, mixes, lane) in enumerate(zip(frags, paths, lanes)):
-            if isinstance(dest, ServiceDest):
+            if isinstance(dest, EndpointDest):
+                from .endpoint import entry_header
+                d = dest.desc
+                body = entry_header(d.host, d.ports[i % len(d.ports)], d.link_fp) + frag.pack()
+                pkt = self._forward_packet(lane.gateway, mixes, ex_for[i],
+                                           S.Routing(S.DELIVER_ENDPOINT, 0, b"", b""), body)
+                finals.append(ex_for[i].node_id)
+            elif isinstance(dest, ServiceDest):
                 gw, mailbox = dest.intros[i % len(dest.intros)]
                 pkt = self._forward_packet(lane.gateway, mixes, gw,
                                            S.Routing(S.DELIVER_MAILBOX, 0, mailbox, b"\0" * 8), frag.pack())
@@ -328,6 +353,9 @@ class MosaicClient:
                 pkt = self._forward_packet(lane.gateway, mixes, dest,
                                            S.Routing(S.DELIVER_EXIT, 0, b"", b""), frag.pack())
             lane.queue.put_nowait((W.F_PACKET, pkt))
+        if self.path_log is not None:
+            self.path_log.append([[l.gateway.node_id] + [m.node_id for m in mp] + finals[i:i + 1]
+                                  for i, (l, mp) in enumerate(zip(lanes, paths))])
         self.stats["messages_split"] += 1
         self.stats["fragments_sent"] += n
 
@@ -452,6 +480,13 @@ class MosaicClient:
             raise StreamError("service has no reachable intro gateway")
         return ServiceDest(d, intros)
 
+    def add_endpoint(self, desc) -> None:
+        """검증된 엔드포인트 기술자 등록. 이후 그 도메인으로 가는 연결은 다중 입구 마름모를 쓴다."""
+        if desc.verify():
+            old = self.endpoints.get(desc.domain)
+            if old is None or old.published <= desc.published:
+                self.endpoints[desc.domain] = desc
+
     def exit_for_key(self, isolation: str) -> Descriptor:
         exits = self.consensus.by_role("exit")
         d = self.exit_for.get(isolation)
@@ -466,7 +501,10 @@ class MosaicClient:
     async def open_stream(self, host: str, port: int, isolation: str = "", timeout: float = 60) -> MStream:
         await self.ready.wait()
         sid = os.urandom(16)
-        if host.lower().endswith(".mosaic"):
+        if host.lower().rstrip(".") in self.endpoints:
+            ed = self.endpoints[host.lower().rstrip(".")]
+            st = MStream(self, EndpointDest(ed), sid, E.ClientSession(sid, ed.x25519_pk, ed.mlkem_pk))
+        elif host.lower().endswith(".mosaic"):
             dest = await self._service_dest(host.lower())
             st = MStream(self, dest, sid, E.ClientSession(sid, dest.desc.x25519_pk, dest.desc.mlkem_pk))
         else:

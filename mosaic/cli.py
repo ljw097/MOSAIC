@@ -59,6 +59,14 @@ def chromium_flags(socks_port: int, profile_dir: str, no_js: bool) -> list[str]:
 async def _run_client_stack(args, authorities, threshold):
     client = MosaicClient(authorities, threshold, args.profile)
     await client.start()
+    for path in getattr(args, "endpoint_file", None) or []:
+        from .endpoint import EndpointDescriptor
+        with open(path) as f:
+            d = EndpointDescriptor.from_json(json.load(f))
+        if not d.verify():
+            raise SystemExit(f"invalid endpoint descriptor: {path}")
+        client.add_endpoint(d)
+        print(f"[mosaic] 다중 입구 엔드포인트 등록: {d.domain} ({len(d.ports)}개 입구)", flush=True)
     socks = SocksServer(client, "127.0.0.1", args.socks)
     await socks.start()
     print(f"[mosaic] SOCKS5 프록시: socks5h://127.0.0.1:{args.socks}", flush=True)
@@ -146,32 +154,75 @@ def cmd_serve(args):
     asyncio.run(main())
 
 
-async def _demo_service(authorities, threshold):
-    """테스트망용 데모 .mosaic 서비스: 출구 없이 E2E로 도달하는 작은 웹사이트."""
-    from .directory import ServiceKeys
-    from .service import ServiceHost
-
+def _demo_web(title: str, lead: str, items: list[str]):
     async def web(r, w):
         try:
             await r.readuntil(b"\r\n\r\n")
         except Exception:      # noqa: BLE001
             w.close()
             return
-        body = ("<!doctype html><html lang=ko><meta charset=utf-8><title>MOSAIC 데모 서비스</title>"
-                "<body style='font:16px system-ui;max-width:640px;margin:40px auto'>"
-                "<h1>◇ 출구 없는 통신</h1><p>이 페이지는 <b>.mosaic</b> 네이티브 서비스에서 왔습니다.</p>"
-                "<ul><li>출구 노드가 없습니다. 조각들이 서비스 자신에게서 다시 모입니다.</li>"
-                "<li>종단 간 암호화(X25519 + ML-KEM-768). 게이트웨이와 믹스는 조각을 모아도 읽지 못합니다.</li>"
-                "<li>서비스는 당신이 누구인지 모르고, 당신은 서비스의 IP를 모릅니다.</li></ul></body></html>").encode()
+        lis = "".join(f"<li>{i}</li>" for i in items)
+        body = (f"<!doctype html><html lang=ko><meta charset=utf-8><title>MOSAIC 데모</title>"
+                f"<body style='font:16px system-ui;max-width:640px;margin:40px auto'>"
+                f"<h1>{title}</h1><p>{lead}</p><ul>{lis}</ul></body></html>").encode()
         w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n"
                 b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         await w.drain()
         w.close()
+    return web
 
-    srv = await asyncio.start_server(web, "127.0.0.1", 0)
+
+async def _demo_endpoint():
+    """테스트망용 데모 다중 입구 엔드포인트: 입구 포트 3개, 서버가 직접 조각을 합친다."""
+    from .endpoint import EndpointHost, EndpointKeys
+    srv = await asyncio.start_server(_demo_web(
+        "◇ 다중 입구 엔드포인트", "이 페이지의 요청은 서로 다른 출구 3곳을 거쳐 서버의 입구 3개로 들어왔습니다.",
+        ["출구는 메시지당 조각 하나만 중계했습니다. 출구가 연결을 대신 맺지도, 내용을 모으지도 않았습니다.",
+         "출구가 모두 공모해 조각을 합쳐도 종단 간 암호문(X25519 + ML-KEM-768)만 얻습니다.",
+         "서버가 k개 조각으로 직접 복원했습니다. 출구 하나가 조각을 버려도 메시지는 도착합니다."]), "127.0.0.1", 0)
+    ep = EndpointHost(EndpointKeys.generate(), "demo-shop.example", "127.0.0.1", [0, 0, 0],
+                      srv.sockets[0].getsockname()[:2])
+    await ep.start()
+    return ep
+
+
+async def _demo_service(authorities, threshold):
+    """테스트망용 데모 .mosaic 서비스: 출구 없이 E2E로 도달하는 작은 웹사이트."""
+    from .directory import ServiceKeys
+    from .service import ServiceHost
+
+    srv = await asyncio.start_server(_demo_web(
+        "◇ 출구 없는 통신", "이 페이지는 <b>.mosaic</b> 네이티브 서비스에서 왔습니다.",
+        ["출구 노드가 없습니다. 조각들이 서비스 자신에게서 다시 모입니다.",
+         "종단 간 암호화(X25519 + ML-KEM-768). 게이트웨이와 믹스는 조각을 모아도 읽지 못합니다.",
+         "서비스는 당신이 누구인지 모르고, 당신은 서비스의 IP를 모릅니다."]), "127.0.0.1", 0)
     host = ServiceHost(ServiceKeys.generate(), authorities, threshold, srv.sockets[0].getsockname()[:2])
     await host.start()
     return host
+
+
+def cmd_endpoint(args):
+    from .endpoint import EndpointHost, EndpointKeys
+
+    async def main():
+        keys = EndpointKeys.load_or_create(args.key)
+        port_map = {}
+        for b in args.backend:
+            vport, target = b.split("=", 1)
+            port_map[int(vport)] = _hostport(target)
+        ports = [int(p) for p in args.ports.split(",")]
+        ep = EndpointHost(keys, args.domain, args.listen, ports, None, port_map, args.public_host)
+        await ep.start()
+        doc = ep.well_known()
+        if args.well_known_out:
+            with open(args.well_known_out, "wb") as f:
+                f.write(doc)
+        print(f"[mosaic] 엔드포인트 {args.domain}: 입구 {ep.ports}, 백엔드 {port_map}", flush=True)
+        print("[mosaic] 이 문서를 https://%s/.well-known/mosaic.json 에 올리고, 응답 헤더에 "
+              "'Mosaic-Endpoint: /.well-known/mosaic.json'을 추가하세요." % args.domain, flush=True)
+        await _forever()
+        await ep.stop()
+    asyncio.run(main())
 
 
 def cmd_testnet(args):
@@ -186,7 +237,10 @@ def cmd_testnet(args):
             print("    --authority", s, flush=True)
         demo = await _demo_service(tn.authority_specs, tn.threshold)
         print(f"[mosaic] 데모 .mosaic 서비스: http://{demo.address}/", flush=True)
+        ep = await _demo_endpoint()
         client, _s, browser, proc = await _run_client_stack(args, tn.authority_specs, tn.threshold)
+        client.add_endpoint(ep.descriptor())
+        print(f"[mosaic] 데모 다중 입구 엔드포인트: http://{ep.domain}/  (입구 포트 {ep.ports})", flush=True)
         await _forever()
         await demo.stop()
         if proc:
@@ -223,6 +277,7 @@ def main(argv=None):
         p.add_argument("--chromium", action="store_true", help="Chromium을 MOSAIC 전용 설정으로 실행 (호환 모드)")
         p.add_argument("--chromium-path")
         p.add_argument("--allow-js", action="store_true", help="호환 모드에서 JS 허용 (익명성 약화)")
+        p.add_argument("--endpoint-file", action="append", help="신뢰할 엔드포인트 기술자 JSON (여러 번)")
 
     n = sub.add_parser("node", help="게이트웨이/믹스/출구 노드 실행")
     n.add_argument("--role", choices=["gateway", "mix", "exit"], required=True)
@@ -247,6 +302,16 @@ def main(argv=None):
     sv.add_argument("--profile", choices=sorted(PROFILES), default="interactive")
     add_auth(sv)
     sv.set_defaults(fn=cmd_serve)
+
+    e = sub.add_parser("endpoint", help="공개 서버를 다중 입구 엔드포인트로 (서버가 여러 출구에서 조각을 직접 받아 합침)")
+    e.add_argument("--key", required=True)
+    e.add_argument("--domain", required=True)
+    e.add_argument("--listen", default="0.0.0.0")
+    e.add_argument("--public-host", required=True, help="출구가 접속할 입구 주소 (IP/호스트명)")
+    e.add_argument("--ports", default="7001,7002,7003", help="입구 포트들 (쉼표)")
+    e.add_argument("--backend", action="append", required=True, help="가상포트=host:port (예: 443=127.0.0.1:443)")
+    e.add_argument("--well-known-out", help=".well-known/mosaic.json 저장 경로")
+    e.set_defaults(fn=cmd_endpoint)
 
     t = sub.add_parser("testnet", help="로컬 테스트망 + 클라이언트 + 브라우저를 한 번에 실행")
     t.add_argument("--base-port", type=int, default=17000)

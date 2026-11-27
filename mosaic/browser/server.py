@@ -41,10 +41,12 @@ MULTI_SUFFIX = {"co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "co.uk", "
                 "ne.jp", "or.jp", "com.au", "net.au", "com.cn", "com.br", "co.in", "github.io"}
 
 
-def is_secure(url: str) -> bool:
-    """출구 노드가 내용을 읽을 수 없는 URL인가: HTTPS(종단 TLS) 또는 .mosaic(종단 E2E, 출구 없음)."""
+def is_secure(url: str, endpoints=()) -> bool:
+    """출구 노드가 내용을 읽을 수 없는 URL인가: HTTPS(종단 TLS), .mosaic(E2E, 출구 없음),
+    또는 다중 입구 엔드포인트 도메인(E2E, 출구는 조각 하나씩만 중계)."""
     sp = urlsplit(url)
-    return sp.scheme == "https" or (sp.hostname or "").endswith(".mosaic")
+    host = sp.hostname or ""
+    return sp.scheme == "https" or host.endswith(".mosaic") or host in endpoints
 
 
 def site_of(host: str) -> str:
@@ -103,6 +105,27 @@ class BrowserServer:
         if self.httpd:
             self.httpd.shutdown()
 
+    def endpoint_domains(self) -> frozenset:
+        return frozenset(self.client.endpoints) if self.client is not None else frozenset()
+
+    def discover_endpoint(self, url: str):
+        """HTTPS 응답에 Mosaic-Endpoint 헤더가 있으면 .well-known 기술자를 HTTPS로 받아 검증하고 등록한다.
+        도메인 인증서가 키 결합을 보증한다 (Tor의 Onion-Location과 같은 발상)."""
+        from .fetcher import fetch as _fetch
+        from ..endpoint import WELL_KNOWN, parse_well_known
+        sp = urlsplit(url)
+        if sp.scheme != "https" or self.client is None or sp.hostname in self.client.endpoints:
+            return
+        try:
+            r = _fetch(self.socks, f"https://{sp.netloc}{WELL_KNOWN}", "site:" + site_of(sp.hostname), None, "",
+                       extra={"Accept": "application/json"})
+            if r.status == 200 and urlsplit(r.url).scheme == "https":
+                d = parse_well_known(sp.hostname, r.body)
+                self.loop.call_soon_threadsafe(self.client.add_endpoint, d)
+                log.info("endpoint discovered for %s: %d entry ports", sp.hostname, len(d.ports))
+        except Exception as e:      # noqa: BLE001
+            log.info("endpoint discovery for %s failed: %s", sp.hostname, e)
+
     def new_identity(self):
         self.jar.clear()
         if self.client and self.loop:
@@ -110,13 +133,20 @@ class BrowserServer:
 
     def toolbar(self, url: str, insecure: bool = False) -> str:
         p = self.prefix
+        host = urlsplit(url).hostname or ""
+        badge = ""
+        if host in self.endpoint_domains():
+            badge = ('<span class="btn" title="이 사이트는 서로 다른 출구에서 조각을 받아 서버가 직접 합칩니다 '
+                     '(종단 간 암호화)">◇ 다중 입구</span>')
+        elif host.endswith(".mosaic"):
+            badge = '<span class="btn" title="출구 없음, 종단 간 암호화">◇ .mosaic</span>'
         warn = ('<div id="mosaic-warn">⚠ 암호화되지 않은 HTTP 연결입니다. 출구 노드가 내용을 볼 수 있습니다.</div>'
                 if insecure else "")
         return (f'<style>{STYLE}</style><div id="mosaic-bar"><a class="logo" href="{p}/">MOSAIC</a>'
                 f'<form action="{p}/view" method="get"><input type="text" name="u" value="{html.escape(url)}" '
                 f'placeholder="주소 또는 https://..." autocomplete="off"><button type="submit">이동</button></form>'
                 f'<form action="{p}/newid" method="post" style="flex:0"><button type="submit" '
-                f'title="쿠키 삭제 + 새 출구">새 신원</button></form><a class="btn" href="{p}/status">상태</a></div>{warn}')
+                f'title="쿠키 삭제 + 새 출구">새 신원</button></form>{badge}<a class="btn" href="{p}/status">상태</a></div>{warn}')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -204,6 +234,8 @@ class Handler(BaseHTTPRequestHandler):
 <li>JavaScript를 실행하지 않습니다. 지문채취와 WebRTC IP 누출이 원천적으로 막힙니다.</li>
 <li>사이트마다 출구와 쿠키 저장소가 따로라서, 사이트들이 서로 정보를 모아 당신을 추적할 수 없습니다.</li>
 <li>HTTPS 전용입니다. 출구 노드도 내용을 볼 수 없습니다. 평문 HTTP는 매번 확인을 받습니다.</li>
+<li>사이트가 MOSAIC 다중 입구를 지원하면(<code>Mosaic-Endpoint</code> 헤더) 자동으로 전환합니다. 조각이 서로 다른
+출구를 거쳐 서버의 여러 입구로 들어가고, 서버가 직접 합칩니다. 출구 하나가 메시지를 통째로 보지 못합니다.</li>
 <li><code>.mosaic</code> 주소는 출구 노드 없이 상대 서버까지 종단 간 암호화(X25519+ML-KEM)로 갑니다.</li>
 </ul>
 <p>위 주소창에 주소를 입력하세요. 예: <code>example.com</code></p>""")
@@ -240,13 +272,14 @@ class Handler(BaseHTTPRequestHandler):
         if sp.scheme not in ("http", "https") or not sp.hostname:
             self._err("http/https 주소만 지원합니다.", 400, raw)
             return
-        if not is_secure(url) and not ok:
+        if not is_secure(url, s.endpoint_domains()) and not ok:
             self._https_only(url, method)
             return
         top = site_of(sp.hostname)
         extra = {"Content-Type": ctype} if ctype else None
         try:
-            r = fetch(s.socks, url, "site:" + top, s.jar, top, method, body, extra, allow_insecure=ok)
+            r = fetch(s.socks, url, "site:" + top, s.jar, top, method, body, extra, allow_insecure=ok,
+                      secure_hosts=s.endpoint_domains())
         except Exception as e:      # noqa: BLE001
             self._err(f"{type(e).__name__}: {e}", url=url)
             return
@@ -271,7 +304,9 @@ class Handler(BaseHTTPRequestHandler):
         s = self.server_ref
         ctype = r.header("Content-Type", "application/octet-stream")
         mime = ctype.split(";")[0].strip().lower()
-        insecure = not is_secure(r.url)
+        insecure = not is_secure(r.url, s.endpoint_domains())
+        if r.header("Mosaic-Endpoint") and urlsplit(r.url).scheme == "https":
+            threading.Thread(target=s.discover_endpoint, args=(r.url,), daemon=True).start()
         if mime in ("text/html", "application/xhtml+xml"):
             text = r.body.decode(_charset(ctype, r.body), errors="replace")
             rw = Rewriter(s.prefix, top)
@@ -298,11 +333,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b"", "text/plain")
             return
         top = top or site_of(sp.hostname or "")
-        if not is_secure(url):
+        if not is_secure(url, s.endpoint_domains()):
             self._send(204, b"", "text/plain")    # 평문 HTTP 하위 리소스 차단 (출구가 읽을 수 있음)
             return
         try:
-            r = fetch(s.socks, url, "site:" + top, s.jar, top, extra={"Accept": "*/*"})
+            r = fetch(s.socks, url, "site:" + top, s.jar, top, extra={"Accept": "*/*"},
+                      secure_hosts=s.endpoint_domains())
         except Exception:      # noqa: BLE001
             self._send(502, b"", "text/plain")
             return

@@ -33,32 +33,100 @@ PENDING_LIMIT = 64
 
 
 class _ServiceExit(ExitService):
-    """출구 세션 로직을 재사용하되, 요청된 host:port와 상관없이 로컬 대상에만 연결한다."""
+    """출구 세션 로직을 재사용하되, 요청된 host와 상관없이 로컬 백엔드에만 연결한다 (포트별 매핑 가능)."""
 
-    def __init__(self, target: tuple[str, int]):
+    def __init__(self, target: tuple[str, int] | None, port_map: dict[int, tuple[str, int]] | None = None):
         super().__init__(allow_private=True)
-        self.target = target
+        self.target, self.port_map = target, port_map or {}
 
     async def _connect(self, host: str, port: int):
-        return await asyncio.wait_for(asyncio.open_connection(*self.target), 20)
+        t = self.port_map.get(port, self.target)
+        if t is None:
+            raise PermissionError(f"no backend for port {port}")
+        return await asyncio.wait_for(asyncio.open_connection(*t), 20)
 
 
-class ServiceHost:
-    def __init__(self, keys: ServiceKeys, authorities, threshold: int, target: tuple[str, int],
-                 profile="interactive"):
-        self.keys = keys
-        self.authorities = authorities
-        self.client = MosaicClient(authorities, threshold, profile)
-        self.client.on_forward = self._on_forward
-        self.exit = _ServiceExit(target)
+class E2EReceiver:
+    """조각 → (k개) 복원 → E2E 복호 → 셀 → 백엔드 세션. .mosaic 서비스와 다중 입구 엔드포인트가 공유한다.
+    send_packet(first_hop, packet)은 하위 클래스가 구현한다 (응답 SURB 패킷을 망에 넣는 방법)."""
+
+    def __init__(self, x25519_sk: bytes, mlkem_seed: bytes, target, port_map=None):
+        self._x25519_sk, self._mlkem_seed = x25519_sk, mlkem_seed
+        self.exit = _ServiceExit(target, port_map)
         self.exit.node = self
         self.exit.wrap = self._wrap
         self.exit.reply_overhead = E.OVERHEAD
         self.reasm = P.Reassembler()
         self.sessions: dict[bytes, E.ServerSession] = {}
         self.waiting: dict[bytes, list[tuple[float, bytes]]] = {}
-        self.tasks: list[asyncio.Task] = []
         self.stats = {"fragments": 0, "messages": 0, "e2e_fail": 0}
+
+    def on_fragment_body(self, body: bytes):
+        frag = P.parse(body)
+        if frag is None:
+            return
+        self.stats["fragments"] += 1
+        msg = self.reasm.add(frag)
+        if msg is not None:
+            self.stats["messages"] += 1
+            self._on_message(msg)
+
+    def gc(self):
+        now = time.time()
+        self.reasm.gc()
+        self.waiting = {c: [(t, m) for t, m in v if now - t < 60] for c, v in self.waiting.items()}
+        self.waiting = {c: v for c, v in self.waiting.items() if v}
+
+    def _on_message(self, msg: bytes):
+        info = E.peek(msg)
+        if info is None:
+            return
+        t, conn = info
+        try:
+            if t == E.T_INIT:
+                if conn in self.sessions:
+                    return
+                sess, pt = E.ServerSession.accept(msg, self._x25519_sk, self._mlkem_seed)
+                self.sessions[conn] = sess
+                self._deliver(conn, pt)
+                for _t, m in self.waiting.pop(conn, []):     # INIT보다 먼저 도착한 메시지
+                    self._deliver(conn, sess.open(m))
+            elif t == E.T_UP:
+                sess = self.sessions.get(conn)
+                if sess is None:
+                    q = self.waiting.setdefault(conn, [])
+                    if len(q) < PENDING_LIMIT and len(self.waiting) < 10_000:
+                        q.append((time.time(), msg))
+                    return
+                self._deliver(conn, sess.open(msg))
+        except E.E2EError:
+            self.stats["e2e_fail"] += 1
+
+    def _deliver(self, conn: bytes, pt: bytes):
+        try:
+            cell = K.Cell.unpack(pt)
+        except ValueError:
+            return
+        if cell.session != conn:        # 세션 id는 E2E 연결 id와 같아야 한다
+            return
+        self.exit.on_cell(cell)
+
+    def _wrap(self, sid: bytes, msg: bytes) -> bytes:
+        return self.sessions[sid].seal(msg)
+
+    async def send_packet(self, first_hop: bytes, packet: bytes):
+        raise NotImplementedError
+
+
+class ServiceHost(E2EReceiver):
+    def __init__(self, keys: ServiceKeys, authorities, threshold: int, target: tuple[str, int],
+                 profile="interactive"):
+        super().__init__(keys.x25519_sk, keys.mlkem_seed, target)
+        self.keys = keys
+        self.authorities = authorities
+        self.client = MosaicClient(authorities, threshold, profile)
+        self.client.on_forward = self._on_forward
+        self.tasks: list[asyncio.Task] = []
 
     @property
     def address(self) -> str:
@@ -85,63 +153,14 @@ class ServiceHost:
         while True:
             await asyncio.sleep(300)
             await publish_service(self.authorities, self.descriptor())
-            now = time.time()
-            self.reasm.gc()
-            self.waiting = {c: [(t, m) for t, m in v if now - t < 60] for c, v in self.waiting.items()}
-            self.waiting = {c: v for c, v in self.waiting.items() if v}
+            self.gc()
 
-    # ------------------------------------------------------------ 수신
     def _on_forward(self, payload: bytes):
         try:
             body = S.check_integrity(payload)
         except S.SphinxError:
             return
-        frag = P.parse(body)
-        if frag is None:
-            return
-        self.stats["fragments"] += 1
-        msg = self.reasm.add(frag)
-        if msg is not None:
-            self.stats["messages"] += 1
-            self._on_message(msg)
-
-    def _on_message(self, msg: bytes):
-        info = E.peek(msg)
-        if info is None:
-            return
-        t, conn = info
-        try:
-            if t == E.T_INIT:
-                if conn in self.sessions:
-                    return
-                sess, pt = E.ServerSession.accept(msg, self.keys.x25519_sk, self.keys.mlkem_seed)
-                self.sessions[conn] = sess
-                self._deliver(conn, pt)
-                for _t, m in self.waiting.pop(conn, []):     # INIT보다 먼저 도착한 메시지
-                    self._deliver(conn, sess.open(m))
-            elif t == E.T_UP:
-                sess = self.sessions.get(conn)
-                if sess is None:
-                    q = self.waiting.setdefault(conn, [])
-                    if len(q) < PENDING_LIMIT and len(self.waiting) < 10_000:
-                        q.append((time.time(), msg))
-                    return
-                self._deliver(conn, sess.open(msg))
-        except E.E2EError:
-            self.stats["e2e_fail"] += 1
-
-    def _deliver(self, conn: bytes, pt: bytes):
-        try:
-            cell = K.Cell.unpack(pt)
-        except ValueError:
-            return
-        if cell.session != conn:        # 세션 id는 E2E 연결 id와 같아야 한다
-            return
-        self.exit.on_cell(cell)
-
-    # ------------------------------------------------------------ 송신
-    def _wrap(self, sid: bytes, msg: bytes) -> bytes:
-        return self.sessions[sid].seal(msg)
+        self.on_fragment_body(body)
 
     async def send_packet(self, first_hop: bytes, packet: bytes):
         """SURB 응답 패킷을 게이트웨이 링크의 Poisson 큐에 넣는다. 게이트웨이가 첫 홉으로 전달한다."""

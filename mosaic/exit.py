@@ -56,6 +56,9 @@ class ExitService:
         self.reasm = P.Reassembler()
         self._gc = None
         self.wrap = None            # 응답 셀 래퍼 (네이티브 서비스의 E2E 암호화)
+        self.endpoint_links: dict[tuple, object] = {}
+        self.endpoint_locks: dict[tuple, asyncio.Lock] = {}
+        self.endpoint_stats = {"fragments_relayed": 0, "replies_relayed": 0}
         self.reply_overhead = 0
 
     def policy(self) -> dict:
@@ -83,6 +86,52 @@ class ExitService:
         except ValueError:
             return
         self.on_cell(cell)
+
+    # ------------------------------------------------------------ 다중 입구 엔드포인트
+    def on_endpoint_payload(self, payload: bytes):
+        """조각 하나를 엔드포인트 입구로 넘긴다. 출구는 이 조각을 모으지도, 열지도 못한다 (E2E)."""
+        from .endpoint import parse_entry
+        try:
+            body = S.check_integrity(payload)
+        except S.SphinxError:
+            return
+        e = parse_entry(body)
+        if e is not None:
+            asyncio.create_task(self._to_endpoint(*e))
+
+    async def _to_endpoint(self, host: str, port: int, fp: bytes, frag: bytes):
+        from . import wire as W
+        key = (host, port, fp)
+        link = self.endpoint_links.get(key)
+        if link is None or link.closed:
+            async with self.endpoint_locks.setdefault(key, asyncio.Lock()):
+                link = self.endpoint_links.get(key)
+                if link is None or link.closed:
+                    try:
+                        r, w = await self._connect(host, port)      # 출구 정책·상위 프록시 그대로 적용
+                        link = await W.connect_pinned(r, w, fp)
+                    except Exception as e:      # noqa: BLE001
+                        log.info("endpoint %s:%d unreachable: %s", host, port, e)
+                        return
+                    self.endpoint_links[key] = link
+                    asyncio.create_task(self._endpoint_reader(link))
+        try:
+            await link.send(W.F_ENDPOINT_FRAG, frag)
+            self.endpoint_stats["fragments_relayed"] += 1
+        except Exception:      # noqa: BLE001
+            link.close()
+
+    async def _endpoint_reader(self, link):
+        """엔드포인트가 이 링크로 돌려보내는 응답 SURB 패킷을 믹스넷에 넣는다."""
+        from . import wire as W
+        try:
+            while True:
+                ftype, body = await link.recv()
+                if ftype == W.F_FORWARD:
+                    self.endpoint_stats["replies_relayed"] += 1
+                    await self.node.send_packet(body[:16], body[16:16 + S.PACKET_LEN])
+        except Exception:      # noqa: BLE001
+            link.close()
 
     def on_cell(self, cell: K.Cell):
         if cell.type == K.C_DROP:
