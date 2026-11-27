@@ -7,6 +7,7 @@ import socket
 import ssl
 import struct
 import threading
+import time
 import zlib
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -17,7 +18,7 @@ UNIFORM_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate",
-    "Connection": "close",
+    "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
 MAX_BODY = 25 * 1024 * 1024
@@ -82,16 +83,18 @@ class CookieJar:
     jars: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def header(self, top: str, host: str) -> str:
+    def header(self, top: str, host: str, secure: bool = True) -> str:
+        """secure=False(평문 HTTP)이면 Secure 쿠키는 보내지 않는다. 출구가 세션 쿠키를 훔쳐보지 못하게."""
         with self.lock:
             j = self.jars.get(top, {})
             out = {}
             for dom, cookies in j.items():
                 if host == dom or host.endswith("." + dom):
-                    out.update(cookies)
+                    out.update({k: v for k, (v, sec) in cookies.items() if secure or not sec})
             return "; ".join(f"{k}={v}" for k, v in out.items())
 
-    def store(self, top: str, host: str, set_cookies: list[str]):
+    def store(self, top: str, host: str, set_cookies: list[str], secure: bool = True):
+        from .server import MULTI_SUFFIX
         with self.lock:
             j = self.jars.setdefault(top, {})
             for sc in set_cookies:
@@ -99,17 +102,87 @@ class CookieJar:
                 if "=" not in parts[0]:
                     continue
                 name, value = parts[0].split("=", 1)
+                name = name.strip()
+                attrs = {p.split("=", 1)[0].strip().lower(): (p.split("=", 1)[1].strip() if "=" in p else "")
+                         for p in parts[1:]}
+                is_secure = "secure" in attrs or name.startswith(("__Secure-", "__Host-"))
+                if is_secure and not secure:
+                    continue                       # 평문 응답이 Secure 쿠키를 심는 것은 거부 (RFC 6265bis)
                 dom = host
-                for p in parts[1:]:
-                    if p.lower().startswith("domain="):
-                        d = p[7:].lstrip(".").lower()
-                        if host == d or host.endswith("." + d):
-                            dom = d
-                j.setdefault(dom, {})[name] = value
+                d = attrs.get("domain", "").lstrip(".").lower()
+                # 공개 접미사(co.kr, com 등)에는 쿠키를 걸 수 없다
+                if d and (host == d or host.endswith("." + d)) and "." in d and d not in MULTI_SUFFIX \
+                        and not name.startswith("__Host-"):
+                    dom = d
+                try:
+                    expired = "max-age" in attrs and int(attrs["max-age"]) <= 0
+                except ValueError:
+                    expired = False
+                if expired:
+                    j.get(dom, {}).pop(name, None)
+                else:
+                    j.setdefault(dom, {})[name] = (value, is_secure)
 
     def clear(self):
         with self.lock:
             self.jars.clear()
+
+
+def _secure_transport(sp, secure_hosts) -> bool:
+    """출구가 내용을 볼 수 없는 연결인가: TLS, .mosaic(E2E), 다중 입구 엔드포인트(E2E)."""
+    h = sp.hostname or ""
+    return sp.scheme == "https" or h.endswith(".mosaic") or h in secure_hosts
+
+
+class ConnPool:
+    """사이트(격리 키)별 keep-alive 연결 풀. 연결 하나 = 믹스넷 스트림 하나이므로, 재사용하면 스트림마다
+    드는 SURB 공급(상향 패킷)과 연결 지연이 사라진다. 격리 키가 키에 들어가 사이트끼리 연결을 공유하지 않는다."""
+
+    def __init__(self, max_idle: int = 6, ttl: float = 25):
+        self.max_idle, self.ttl = max_idle, ttl
+        self.idle: dict[tuple, list[tuple["_Conn", float]]] = {}
+        self.lock = threading.Lock()
+        self.stats = {"new": 0, "reused": 0, "retried": 0}
+
+    def get(self, key: tuple, factory) -> tuple["_Conn", bool]:
+        now = time.monotonic()
+        with self.lock:
+            lst = self.idle.get(key, [])
+            while lst:
+                conn, t = lst.pop()
+                if now - t < self.ttl and conn.sock is not None:
+                    self.stats["reused"] += 1
+                    return conn, True
+                conn.close()
+            self.stats["new"] += 1
+        return factory(), False
+
+    def put(self, key: tuple, conn: "_Conn"):
+        with self.lock:
+            lst = self.idle.setdefault(key, [])
+            if len(lst) < self.max_idle:
+                lst.append((conn, time.monotonic()))
+                return
+        conn.close()
+
+    def drop(self, isolation: str):
+        """한 격리 키(사이트)의 유휴 연결만 닫는다."""
+        with self.lock:
+            for key in [k for k in self.idle if k[3] == isolation]:
+                for conn, _ in self.idle.pop(key):
+                    conn.close()
+
+    def clear(self):
+        with self.lock:
+            for lst in self.idle.values():
+                for conn, _ in lst:
+                    conn.close()
+            self.idle.clear()
+
+
+POOL = ConnPool()
+_RETRYABLE = (http.client.RemoteDisconnected, http.client.BadStatusLine, BrokenPipeError, ConnectionResetError,
+              ConnectionAbortedError, http.client.CannotSendRequest)
 
 
 class _Conn(http.client.HTTPConnection):
@@ -128,32 +201,54 @@ class _Conn(http.client.HTTPConnection):
 
 def fetch(proxy: tuple[str, int], url: str, isolation: str, jar: CookieJar | None = None, top: str = "",
           method: str = "GET", body: bytes | None = None, extra: dict | None = None,
-          timeout: float = 120, max_redirects: int = 8) -> Response:
+          timeout: float = 120, max_redirects: int = 8, allow_insecure: bool = False,
+          secure_hosts: frozenset = frozenset()) -> Response:
     for _ in range(max_redirects + 1):
         sp = urlsplit(url)
         if sp.scheme not in ("http", "https") or not sp.hostname:
             raise FetchError("unsupported URL")
+        if (sp.scheme == "http" and not sp.hostname.endswith(".mosaic") and not allow_insecure
+                and sp.hostname not in secure_hosts):
+            raise FetchError(f"HTTPS 전용 모드: 평문 HTTP로 가는 요청/리다이렉트를 막았습니다 ({url})")
         port = sp.port or (443 if sp.scheme == "https" else 80)
-        conn = _Conn(sp.hostname, port, proxy, isolation, timeout, sp.scheme == "https")
+        key = (sp.scheme, sp.hostname, port, isolation, proxy)
+
+        def factory():
+            return _Conn(sp.hostname, port, proxy, isolation, timeout, sp.scheme == "https")
         headers = dict(UNIFORM_HEADERS)
         if extra:
             headers.update(extra)
         if jar is not None:
-            c = jar.header(top, sp.hostname)
+            c = jar.header(top, sp.hostname, secure=_secure_transport(sp, secure_hosts))
             if c:
                 headers["Cookie"] = c
         path = (sp.path or "/") + (f"?{sp.query}" if sp.query else "")
-        try:
-            conn.request(method, path, body=body, headers=headers)
-            r = conn.getresponse()
-            data = r.read(MAX_BODY + 1)
-        finally:
+        for attempt in range(2):
+            conn, reused = POOL.get(key, factory)
+            try:
+                conn.request(method, path, body=body, headers=headers)
+                r = conn.getresponse()
+                data = r.read(MAX_BODY + 1)
+                break
+            except _RETRYABLE:
+                conn.close()
+                # 재사용한 연결이 그새 닫혔을 때만, 그리고 멱등 요청일 때만 새 연결로 한 번 더
+                if not (reused and method in ("GET", "HEAD") and attempt == 0):
+                    raise
+                POOL.stats["retried"] += 1
+            except Exception:
+                conn.close()
+                raise
+        if r.will_close or len(data) > MAX_BODY:
             conn.close()
+        else:
+            POOL.put(key, conn)
         if len(data) > MAX_BODY:
             raise FetchError("response too large")
         hdrs = r.getheaders()
         if jar is not None:
-            jar.store(top, sp.hostname, [v for k, v in hdrs if k.lower() == "set-cookie"])
+            jar.store(top, sp.hostname, [v for k, v in hdrs if k.lower() == "set-cookie"],
+                      secure=_secure_transport(sp, secure_hosts))
         enc = r.getheader("Content-Encoding", "").lower()
         try:
             if enc == "gzip":

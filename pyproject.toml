@@ -17,3 +17,6 @@ mosaic = "mosaic.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["mosaic*"]
+
+[tool.setuptools.package-data]
+"mosaic.browser" = ["static/*"]

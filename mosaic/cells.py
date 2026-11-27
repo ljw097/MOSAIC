@@ -10,12 +10,19 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from .sphinx import INTEGRITY, PAYLOAD_LEN, SURB, SURB_LEN
+from .sphinx import SURB, SURB_LEN
+from .split import max_message
 
 HDR = struct.Struct(">B16sIH")
-BODY_LEN = PAYLOAD_LEN - len(INTEGRITY)
-DATA_MAX = BODY_LEN - HDR.size          # 2009
-SURBS_PER_CELL = (DATA_MAX - 1) // SURB_LEN   # 4
+
+
+def data_max(k: int) -> int:
+    """k-of-n 분할 시 셀 하나에 실을 수 있는 데이터 최대 길이."""
+    return max_message(k) - HDR.size
+
+
+def sets_per_cell(k: int, set_size: int) -> int:
+    return (data_max(k) - 2) // (set_size * SURB_LEN)
 
 # 상향 (client -> exit)
 C_OPEN = 1
@@ -38,25 +45,36 @@ class Cell:
     data: bytes
 
     def pack(self) -> bytes:
-        if len(self.data) > DATA_MAX:
-            raise ValueError("cell data too large")
         return HDR.pack(self.type, self.session, self.seq, len(self.data)) + self.data
 
     @classmethod
     def unpack(cls, b: bytes) -> "Cell":
         t, s, q, n = HDR.unpack_from(b)
-        if n > DATA_MAX:
+        if HDR.size + n > len(b):
             raise ValueError("bad cell length")
         return cls(t, s, q, b[HDR.size: HDR.size + n])
 
 
-def pack_surbs(surbs: list[SURB]) -> bytes:
-    assert len(surbs) <= SURBS_PER_CELL
-    return bytes([len(surbs)]) + b"".join(s.pack() for s in surbs)
+def pack_surb_sets(sets: list[list[SURB]], epoch: int) -> bytes:
+    """SURB 묶음: 한 묶음 = 응답 메시지 하나를 n개 조각으로 보낼, 경로가 서로 겹치지 않는 SURB n개.
+    epoch = SURB를 만들 때 쓴 노드 키의 epoch. 노드가 그 키를 지우면 SURB도 못 쓰므로 받는 쪽이 버린다."""
+    size = len(sets[0])
+    return bytes([len(sets), size]) + struct.pack(">I", epoch) + b"".join(s.pack() for st in sets for s in st)
 
 
-def unpack_surbs(data: bytes) -> list[SURB]:
-    n = data[0]
-    if n > SURBS_PER_CELL:
-        raise ValueError("too many surbs")
-    return [SURB.unpack(data[1 + i * SURB_LEN: 1 + (i + 1) * SURB_LEN]) for i in range(n)]
+SETS_HDR = 6
+
+
+def unpack_surb_sets(data: bytes) -> tuple[list[list[SURB]], int]:
+    count, size = data[0], data[1]
+    if not 1 <= size <= 16 or SETS_HDR + count * size * SURB_LEN > len(data):
+        raise ValueError("bad surb sets")
+    epoch = struct.unpack_from(">I", data, 2)[0]
+    out, off = [], SETS_HDR
+    for _ in range(count):
+        st = []
+        for _ in range(size):
+            st.append(SURB.unpack(data[off: off + SURB_LEN]))
+            off += SURB_LEN
+        out.append(st)
+    return out, epoch

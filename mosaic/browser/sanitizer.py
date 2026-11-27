@@ -17,7 +17,13 @@ from urllib.parse import quote, urljoin, urlsplit
 
 DROP_WITH_CONTENT = {"script", "iframe", "frame", "frameset", "object", "applet", "noembed", "template",
                      "portal", "fencedframe"}
-DROP_TAG = {"embed", "base", "param"}
+# SVG SMIL 애니메이션은 href 등 속성을 실행 중에 바꿀 수 있어(정화 이후에!) 링크 재작성을 우회한다 → 태그를 버린다
+DROP_TAG = {"embed", "base", "param", "set", "animate", "animatemotion", "animatetransform", "animatecolor", "discard"}
+FRAME_TAGS = {"iframe", "frame", "frameset", "object", "applet", "portal", "fencedframe", "embed"}
+# URL을 담을 수 있는 모든 속성. 어떤 요소에 있든 프록시 경로로 재작성하거나 버린다 (기본 거부).
+URL_ATTRS = {"href", "xlink:href", "src", "action", "data", "poster", "background", "cite", "longdesc", "usemap",
+             "codebase", "profile", "icon", "archive", "classid", "itemtype", "itemid", "attributionsrc"}
+NAV_TAGS = {"a", "area"}
 UNWRAP = {"noscript"}
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
         "track", "wbr"}
@@ -26,7 +32,7 @@ URL_ATTRS_RES = {("img", "src"), ("source", "src"), ("video", "src"), ("video", 
                  ("track", "src"), ("input", "src"), ("link", "href"), ("image", "href"), ("use", "href"),
                  ("body", "background"), ("table", "background"), ("td", "background")}
 DROP_ATTRS = {"srcdoc", "formaction", "ping", "integrity", "nonce", "xmlns:xlink", "download", "manifest",
-              "http-equiv", "dynsrc", "lowsrc"}
+              "http-equiv", "dynsrc", "lowsrc", "attributename", "values", "from", "to", "by"}
 BAD_SCHEMES = ("javascript:", "vbscript:", "livescript:", "file:", "blob:", "filesystem:")
 
 _css_url = re.compile(r"""url\(\s*(['"]?)(.*?)\1\s*\)""", re.I | re.S)
@@ -82,6 +88,7 @@ class _Sanitizer(HTMLParser):
         self.skip = 0
         self.in_style = False
         self.injected = False
+        self.blocked = {"scripts": 0, "handlers": 0, "frames": 0, "bad_urls": 0, "animations": 0, "refresh": 0}
 
     def _inject(self):
         if not self.injected:
@@ -104,9 +111,14 @@ class _Sanitizer(HTMLParser):
                 self.skip += 1
             return
         if tag in DROP_WITH_CONTENT:
+            self.blocked["scripts" if tag == "script" else "frames"] += 1
             if not selfclose:
                 self.skip = 1
             return
+        if tag in FRAME_TAGS:
+            self.blocked["frames"] += 1
+        if tag in DROP_TAG and tag not in ("base", "param", "embed"):
+            self.blocked["animations"] += 1
         if tag in DROP_TAG or tag in UNWRAP:
             if tag == "base":
                 for k, v in attrs:
@@ -115,7 +127,9 @@ class _Sanitizer(HTMLParser):
             return
         if tag == "meta":
             d = {k: (v or "") for k, v in attrs}
-            if "http-equiv" in d or "charset" in d:
+            if "refresh" in d.get("http-equiv", "").lower():
+                self.blocked["refresh"] += 1
+            if "http-equiv" in d or "charset" in d or d.get("name", "").lower() == "mosaic-blocked":
                 return
         if tag == "link":
             rel = (dict(attrs).get("rel") or "").lower()
@@ -125,44 +139,46 @@ class _Sanitizer(HTMLParser):
         for k, v in attrs:
             k = k.lower()
             v = v or ""
-            if k.startswith("on") or k in DROP_ATTRS:
+            if k.startswith("on"):
+                self.blocked["handlers"] += 1
                 continue
-            if k == "target":
+            if k in DROP_ATTRS or k == "target":
                 continue
-            if (tag, k) in URL_ATTRS_NAV:
-                u = _clean_url(v, self.base)
-                if u is None:
-                    continue
-                v = u if u.startswith("#") else self.rw.nav(u)
-            elif (tag, k) in URL_ATTRS_RES or (k in ("href", "xlink:href") and tag in ("image", "use")):
-                u = _clean_url(v, self.base)
-                if u is None or u.startswith("#"):
-                    continue
-                if u.startswith("data:"):
-                    if tag != "img" or not u.startswith("data:image/"):
-                        continue
-                else:
-                    u = self.rw.res(u)
-                v = u
-            elif k in ("srcset", "imagesrcset"):
+            if k in ("srcset", "imagesrcset"):
                 parts = []
                 for item in v.split(","):
                     bits = item.strip().split()
                     if not bits:
                         continue
                     u = _clean_url(bits[0], self.base)
-                    if u and not u.startswith("data:"):
+                    if u and not u.startswith(("data:", "#")):
                         parts.append(" ".join([self.rw.res(u)] + bits[1:]))
                 v = ", ".join(parts)
             elif k == "style":
                 v = rewrite_css(v, self.base, self.rw)
-            elif k == "action" and tag == "form":
+            elif tag == "form" and k == "action":
                 continue
-            elif k in ("href", "src", "data", "codebase", "cite", "background", "poster", "action"):
+            elif k in URL_ATTRS:
                 u = _clean_url(v, self.base)
                 if u is None:
+                    if v.strip():
+                        self.blocked["bad_urls"] += 1
                     continue
-                v = self.rw.nav(u) if not u.startswith("#") else u
+                if u.startswith("#"):
+                    v = u                       # 문서 내부 참조 (SVG gradient, 앵커 등)
+                elif tag in NAV_TAGS or (tag == "a" and k == "xlink:href"):
+                    v = self.rw.nav(u)          # 이동 링크 → /view
+                elif u.startswith("data:"):
+                    if tag != "img" or not u.startswith("data:image/"):
+                        self.blocked["bad_urls"] += 1
+                        continue
+                    v = u
+                elif tag in ("img", "source", "video", "audio", "track", "input", "link", "image", "use", "body",
+                             "table", "td", "th", "feimage", "pattern", "lineargradient", "radialgradient",
+                             "filter", "textpath", "mpath", "tref", "script", "cursor", "font-face-uri"):
+                    v = self.rw.res(u)          # 하위 리소스 → /res
+                else:
+                    v = self.rw.nav(u)          # 그 밖의 URL 속성(cite 등)은 이동으로 취급, 원본 URL은 절대 남기지 않는다
             out_attrs.append((k, v))
         if tag == "form":
             action = _clean_url(dict(attrs).get("action") or self.base, self.base) or self.base
@@ -205,10 +221,15 @@ class _Sanitizer(HTMLParser):
         pass
 
 
-def sanitize_html(doc: str, base: str, rw: Rewriter, toolbar: str) -> str:
+def sanitize_html(doc: str, base: str, rw: Rewriter, toolbar: str, stats: dict | None = None) -> str:
     p = _Sanitizer(base, rw, toolbar)
     p.feed(doc)
     p.close()
     if not p.injected:
         p.out.insert(1 if p.out and p.out[0].startswith("<!") else 0, toolbar)
+    # 셸이 읽어 "차단됨" 배지에 보여 준다. 페이지가 같은 이름의 meta를 넣어 위조하는 것은 위에서 막았다.
+    summary = ";".join(f"{k}={v}" for k, v in p.blocked.items())
+    p.out.append(f'<meta name="mosaic-blocked" content="{summary}">')
+    if stats is not None:
+        stats.update(p.blocked)
     return "".join(p.out)

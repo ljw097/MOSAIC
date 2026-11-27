@@ -21,7 +21,11 @@ from . import crypto as C
 
 log = logging.getLogger("mosaic.directory")
 DESCRIPTOR_TTL = 3600
-EPOCH_LEN = 3600
+EPOCH_LEN = 3600            # Sphinx 키 로테이션 주기 (초). 테스트에서 줄일 수 있다.
+
+
+def current_epoch(now: float | None = None) -> int:
+    return int((time.time() if now is None else now) // EPOCH_LEN)
 NUM_LAYERS = 3
 ROLES = ("gateway", "mix", "exit")
 
@@ -89,14 +93,22 @@ class Descriptor:
     exit_policy: dict = field(default_factory=dict)
     sig: bytes = b""
     layer: int = -1           # 합의에서 계산 (서명 대상 아님)
+    sphinx_epochs: dict = field(default_factory=dict)    # epoch → 그 epoch의 Sphinx 공개키 (로테이션)
 
     def body(self) -> dict:
-        return {
+        b = {
             "node_id": self.node_id.hex(), "role": self.role, "host": self.host, "port": self.port,
             "identity_pk": self.identity_pk.hex(), "sphinx_pk": self.sphinx_pk.hex(),
             "link_pk": self.link_pk.hex(), "mlkem_pk": self.mlkem_pk.hex(),
             "published": self.published, "exit_policy": self.exit_policy,
         }
+        if self.sphinx_epochs:
+            b["sphinx_epochs"] = {str(e): pk.hex() for e, pk in sorted(self.sphinx_epochs.items())}
+        return b
+
+    def sphinx_key(self, epoch: int | None = None) -> bytes:
+        """패킷을 만들 시점의 epoch 키. 로테이션을 하지 않는 노드면 고정 키."""
+        return self.sphinx_epochs.get(current_epoch() if epoch is None else epoch, self.sphinx_pk)
 
     def to_json(self) -> dict:
         d = self.body()
@@ -108,12 +120,15 @@ class Descriptor:
         return cls(bytes.fromhex(d["node_id"]), d["role"], d["host"], int(d["port"]),
                    bytes.fromhex(d["identity_pk"]), bytes.fromhex(d["sphinx_pk"]),
                    bytes.fromhex(d["link_pk"]), bytes.fromhex(d["mlkem_pk"]), int(d["published"]),
-                   d.get("exit_policy", {}), bytes.fromhex(d.get("sig", "")))
+                   d.get("exit_policy", {}), bytes.fromhex(d.get("sig", "")), -1,
+                   {int(e): bytes.fromhex(pk) for e, pk in d.get("sphinx_epochs", {}).items()})
 
     @classmethod
-    def create(cls, keys: NodeKeys, role: str, host: str, port: int, exit_policy: dict | None = None) -> "Descriptor":
-        d = cls(keys.node_id, role, host, port, keys.identity_pk, keys.sphinx_pk, keys.link_pk, keys.mlkem_pk,
-                int(time.time()), exit_policy or {})
+    def create(cls, keys: NodeKeys, role: str, host: str, port: int, exit_policy: dict | None = None,
+               sphinx_epochs: dict | None = None) -> "Descriptor":
+        cur = (sphinx_epochs or {}).get(current_epoch(), keys.sphinx_pk)
+        d = cls(keys.node_id, role, host, port, keys.identity_pk, cur, keys.link_pk, keys.mlkem_pk,
+                int(time.time()), exit_policy or {}, sphinx_epochs=dict(sphinx_epochs or {}))
         d.sig = C.ed_sign(keys.identity_sk, b"MOSAIC-desc" + canonical(d.body()))
         return d
 
@@ -124,10 +139,94 @@ class Descriptor:
             return False
         if len(self.sphinx_pk) != 32 or len(self.link_pk) != 32 or len(self.mlkem_pk) != C.MLKEM_PK_LEN:
             return False
+        if len(self.sphinx_epochs) > 4 or any(len(pk) != 32 for pk in self.sphinx_epochs.values()):
+            return False
         return C.ed_verify(self.identity_pk, self.sig, b"MOSAIC-desc" + canonical(self.body()))
 
     def digest(self) -> str:
         return C.h(canonical(self.to_json())).hex()
+
+
+# ---------------------------------------------------------------- 서비스 기술자
+SERVICE_TTL = 3600
+
+
+@dataclass
+class ServiceKeys:
+    identity_sk: bytes
+    identity_pk: bytes
+    x25519_sk: bytes
+    x25519_pk: bytes
+    mlkem_seed: bytes
+    mlkem_pk: bytes
+
+    @property
+    def address(self) -> str:
+        from .e2e import service_address
+        return service_address(self.identity_pk)
+
+    @classmethod
+    def generate(cls) -> "ServiceKeys":
+        isk, ipk = C.ed_keygen()
+        xsk, xpk = C.x25519_keygen()
+        ms, mp = C.mlkem_keygen()
+        return cls(isk, ipk, xsk, xpk, ms, mp)
+
+    @classmethod
+    def load_or_create(cls, path: str) -> "ServiceKeys":
+        import os
+        if os.path.exists(path):
+            with open(path) as f:
+                d = json.load(f)
+            return cls(**{k: bytes.fromhex(d[k]) for k in cls.__dataclass_fields__})
+        k = cls.generate()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({f_: getattr(k, f_).hex() for f_ in cls.__dataclass_fields__}, f)
+        return k
+
+
+@dataclass
+class ServiceDescriptor:
+    """네이티브 서비스 기술자. 주소 = H(identity_pk)이므로 자기 인증된다. 권한 서버를 믿을 필요가 없다.
+    intros: 서비스가 조각을 받는 (게이트웨이 id, 우편함 id) 목록. 마름모의 오른쪽 꼭짓점을 넓히는 데 쓴다."""
+    address: str
+    identity_pk: bytes
+    x25519_pk: bytes
+    mlkem_pk: bytes
+    intros: list[tuple[bytes, bytes]]
+    published: int
+    sig: bytes = b""
+
+    def body(self) -> dict:
+        return {"address": self.address, "identity_pk": self.identity_pk.hex(), "x25519_pk": self.x25519_pk.hex(),
+                "mlkem_pk": self.mlkem_pk.hex(), "intros": [[g.hex(), m.hex()] for g, m in self.intros],
+                "published": self.published}
+
+    def to_json(self) -> dict:
+        d = self.body()
+        d["sig"] = self.sig.hex()
+        return d
+
+    @classmethod
+    def from_json(cls, d: dict) -> "ServiceDescriptor":
+        return cls(d["address"], bytes.fromhex(d["identity_pk"]), bytes.fromhex(d["x25519_pk"]),
+                   bytes.fromhex(d["mlkem_pk"]), [(bytes.fromhex(g), bytes.fromhex(m)) for g, m in d["intros"]],
+                   int(d["published"]), bytes.fromhex(d.get("sig", "")))
+
+    @classmethod
+    def create(cls, keys: ServiceKeys, intros: list[tuple[bytes, bytes]]) -> "ServiceDescriptor":
+        d = cls(keys.address, keys.identity_pk, keys.x25519_pk, keys.mlkem_pk, intros, int(time.time()))
+        d.sig = C.ed_sign(keys.identity_sk, b"MOSAIC-svc" + canonical(d.body()))
+        return d
+
+    def verify(self) -> bool:
+        from .e2e import service_address
+        if self.address != service_address(self.identity_pk) or not self.intros or len(self.intros) > 16:
+            return False
+        if len(self.x25519_pk) != 32 or len(self.mlkem_pk) != C.MLKEM_PK_LEN:
+            return False
+        return C.ed_verify(self.identity_pk, self.sig, b"MOSAIC-svc" + canonical(self.body()))
 
 
 # ---------------------------------------------------------------- 권한 서버
@@ -136,6 +235,7 @@ class Authority:
         self.sk, self.pk = sk, C.ed25519.Ed25519PrivateKey.from_private_bytes(sk).public_key().public_bytes_raw()
         self.host, self.port = host, port
         self.descs: dict[bytes, Descriptor] = {}
+        self.services: dict[str, ServiceDescriptor] = {}
         self.server: asyncio.base_events.Server | None = None
 
     async def start(self):
@@ -156,6 +256,14 @@ class Authority:
                     if old is None or old.published <= d.published:
                         self.descs[d.node_id] = d
                 resp = {"ok": ok}
+            elif req.get("op") == "publish_service":
+                d = ServiceDescriptor.from_json(req["descriptor"])
+                ok = d.verify() and abs(time.time() - d.published) < 600 and len(self.services) < 100_000
+                if ok:
+                    old = self.services.get(d.address)
+                    if old is None or old.published <= d.published:
+                        self.services[d.address] = d
+                resp = {"ok": ok}
             elif req.get("op") == "consensus":
                 resp = self.signed_document()
             else:
@@ -171,13 +279,20 @@ class Authority:
         now = time.time()
         descs = sorted((d for d in self.descs.values() if now - d.published < DESCRIPTOR_TTL),
                        key=lambda d: d.node_id)
-        doc = {"epoch": int(now // EPOCH_LEN), "descriptors": [d.to_json() for d in descs]}
+        svcs = sorted((d for d in self.services.values() if now - d.published < SERVICE_TTL),
+                      key=lambda d: d.address)
+        # 서비스 기술자는 합의 문서에 통째로 싣는다 → 조회해도 권한 서버는 어떤 서비스를 찾는지 모른다
+        doc = {"epoch": int(now // EPOCH_LEN), "descriptors": [d.to_json() for d in descs],
+               "services": [d.to_json() for d in svcs]}
         return {"authority": self.pk.hex(), "doc": doc,
                 "sig": C.ed_sign(self.sk, b"MOSAIC-consensus" + canonical(doc)).hex()}
 
 
+MAX_DOC = 64 * 1024 * 1024      # 합의 문서 최대 크기. 기본 readline 한도(64KB)로는 노드가 20개만 넘어도 받지 못한다
+
+
 async def _request(host: str, port: int, req: dict, timeout: float = 10) -> dict:
-    r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    r, w = await asyncio.wait_for(asyncio.open_connection(host, port, limit=MAX_DOC), timeout)
     try:
         w.write(canonical(req) + b"\n")
         await w.drain()
@@ -185,6 +300,17 @@ async def _request(host: str, port: int, req: dict, timeout: float = 10) -> dict
         return json.loads(line)
     finally:
         w.close()
+
+
+async def publish_service(authorities: list[tuple[str, int, bytes]], desc: ServiceDescriptor) -> int:
+    ok = 0
+    for host, port, _pk in authorities:
+        try:
+            resp = await _request(host, port, {"op": "publish_service", "descriptor": desc.to_json()})
+            ok += bool(resp.get("ok"))
+        except Exception as e:     # noqa: BLE001
+            log.warning("publish_service at %s:%d failed: %s", host, port, e)
+    return ok
 
 
 async def register(authorities: list[tuple[str, int, bytes]], desc: Descriptor) -> int:
@@ -203,6 +329,7 @@ async def register(authorities: list[tuple[str, int, bytes]], desc: Descriptor) 
 class Consensus:
     epoch: int
     nodes: dict[bytes, Descriptor]
+    services: dict[str, ServiceDescriptor] = field(default_factory=dict)
 
     def by_role(self, role: str) -> list[Descriptor]:
         return [d for d in self.nodes.values() if d.role == role]
@@ -226,6 +353,7 @@ def build_consensus(documents: list[dict], authority_pks: list[bytes], threshold
     epochs: Counter[int] = Counter()
     trusted = {pk.hex() for pk in authority_pks}
     voted: set[str] = set()
+    services: dict[str, ServiceDescriptor] = {}
     for doc in documents:
         a = doc.get("authority", "")
         if a not in trusted or a in voted:
@@ -236,6 +364,13 @@ def build_consensus(documents: list[dict], authority_pks: list[bytes], threshold
             continue
         voted.add(a)
         epochs[doc["doc"]["epoch"]] += 1
+        for sj in doc["doc"].get("services", []):
+            try:
+                sd = ServiceDescriptor.from_json(sj)
+            except Exception:     # noqa: BLE001
+                continue
+            if sd.verify() and (sd.address not in services or services[sd.address].published < sd.published):
+                services[sd.address] = sd
         for dj in doc["doc"]["descriptors"]:
             d = Descriptor.from_json(dj)
             if not d.verify():
@@ -251,7 +386,7 @@ def build_consensus(documents: list[dict], authority_pks: list[bytes], threshold
             d = seen[dg]
             if d.node_id not in nodes or nodes[d.node_id].published < d.published:
                 nodes[d.node_id] = d
-    c = Consensus(epochs.most_common(1)[0][0], nodes)
+    c = Consensus(epochs.most_common(1)[0][0], nodes, services)
     c.assign_layers()
     return c
 

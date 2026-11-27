@@ -24,14 +24,16 @@ from . import crypto as C
 from .sphinx import PACKET_LEN
 
 MAGIC = b"MOSAIC/1"
-FRAME_PT = 1 + PACKET_LEN + 7          # 2440
+FRAME_PT = 1 + 16 + PACKET_LEN + 7     # 2456 (F_FORWARD가 가장 큼)
 FRAME_CT = FRAME_PT + 16
 
 # 프레임 타입
 F_PACKET = 1      # Sphinx 패킷
 F_DELIVER = 2     # 게이트웨이 -> 클라이언트: surb_id(8) || payload(2048)
-F_REGISTER = 3    # 클라이언트 -> 게이트웨이: mailbox id(16)
+F_REGISTER = 3    # 클라이언트 -> 게이트웨이: mailbox secret(32). 우편함 id = mailbox_id(secret)
 F_DUMMY = 4       # 링크 커버 트래픽
+F_ENDPOINT_FRAG = 6   # 출구 -> 엔드포인트 입구: 조각 하나 (E2E 암호문의 일부)
+F_FORWARD = 5     # 클라이언트(서비스) -> 게이트웨이: target(16) || SURB 패킷. 게이트웨이가 대신 첫 홉으로 전달
 
 
 class LinkError(Exception):
@@ -79,8 +81,38 @@ def _derive(ss1: bytes, ss2: bytes, ss3: bytes, transcript: bytes) -> tuple[byte
     return okm[:32], okm[32:64], okm[64:]     # i->r, r->i, confirm
 
 
+BUNDLE_LEN = 32 + C.MLKEM_PK_LEN
+
+
+def bundle_fingerprint(static_x25519: bytes, static_mlkem: bytes) -> bytes:
+    return C.h(b"MOSAIC link bundle", static_x25519, static_mlkem)
+
+
 async def connect(host: str, port: int, static_x25519: bytes, static_mlkem: bytes, timeout: float = 10) -> Link:
     reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    return await handshake_initiator(reader, writer, static_x25519, static_mlkem, timeout)
+
+
+async def connect_pinned(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, fingerprint: bytes,
+                         timeout: float = 10) -> Link:
+    """엔드포인트 입구 연결: 응답자가 먼저 정적 공개키 묶음을 보내고, 개시자는 32바이트 지문으로 검증한다.
+    조각 헤더에는 ML-KEM 공개키(1184B) 대신 지문만 실으면 된다."""
+    bundle = await asyncio.wait_for(reader.readexactly(BUNDLE_LEN), timeout)
+    sx, sm = bundle[:32], bundle[32:]
+    if not C.ct_eq(bundle_fingerprint(sx, sm), fingerprint):
+        writer.close()
+        raise LinkError("endpoint key fingerprint mismatch")
+    return await handshake_initiator(reader, writer, sx, sm, timeout)
+
+
+async def accept_pinned(reader, writer, static_x25519_sk: bytes, static_mlkem_seed: bytes, static_mlkem_pk: bytes,
+                        timeout: float = 10) -> Link:
+    writer.write(C.x25519_pub(static_x25519_sk) + static_mlkem_pk)
+    await writer.drain()
+    return await accept(reader, writer, static_x25519_sk, static_mlkem_seed, timeout)
+
+
+async def handshake_initiator(reader, writer, static_x25519: bytes, static_mlkem: bytes, timeout: float = 10) -> Link:
     e_sk, e_pk = C.x25519_keygen()
     ss2, ct = C.mlkem_encaps(static_mlkem)
     msg1 = MAGIC + e_pk + ct
@@ -114,6 +146,11 @@ async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, sta
     return Link(reader, writer, k_ri, k_ir)
 
 
+def mailbox_id(secret: bytes) -> bytes:
+    """우편함 id는 비밀값의 해시다. 서비스처럼 id가 공개돼도, 비밀값을 아는 쪽만 그 우편함을 등록(수신)할 수 있다."""
+    return C.h(b"MOSAIC mailbox", secret, n=16)
+
+
 def pack_deliver(surb_id: bytes, payload: bytes) -> bytes:
     return surb_id + payload
 
@@ -123,4 +160,4 @@ def unpack_deliver(body: bytes) -> tuple[bytes, bytes]:
     return body[:SURB_ID_LEN], body[SURB_ID_LEN:SURB_ID_LEN + PAYLOAD_LEN]
 
 
-__all__ = ["Link", "connect", "accept", "F_PACKET", "F_DELIVER", "F_REGISTER", "F_DUMMY", "struct"]
+__all__ = ["Link", "connect", "accept", "F_PACKET", "F_DELIVER", "F_REGISTER", "F_DUMMY", "F_FORWARD", "struct"]

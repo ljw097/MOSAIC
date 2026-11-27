@@ -41,8 +41,8 @@ class Testnet:
             a.server.close()
 
 
-async def start_testnet(base_port: int = 47000, n_authorities: int = 3, threshold: int = 2,
-                        gateways: int = 2, mixes_per_layer: int = 2, exits: int = 2,
+async def start_testnet(base_port: int = 17000, n_authorities: int = 3, threshold: int = 2,
+                        gateways: int = 3, mixes_per_layer: int = 4, exits: int = 2,
                         allow_private: bool = False, upstream_proxy=None,
                         loop_rate: float = 1.0, downstream_rate: float = 150.0,
                         host: str = "127.0.0.1") -> Testnet:

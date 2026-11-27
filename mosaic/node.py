@@ -20,6 +20,8 @@ from collections import deque
 
 from . import sphinx as S
 from . import wire as W
+from . import crypto as C
+from . import directory as D
 from .directory import Consensus, Descriptor, NodeKeys, fetch_consensus, register
 
 log = logging.getLogger("mosaic.node")
@@ -117,7 +119,11 @@ class Node:
         self.loop_rate, self.downstream_rate = loop_rate, downstream_rate
         self.name = name or f"{role}-{keys.node_id.hex()[:6]}"
         self.consensus: Consensus | None = None
-        self.replay = ReplayCache()
+        # epoch별 Sphinx 키와 재전송 캐시. 지난 epoch의 키는 지운다 → 노드를 나중에 압수당해도 과거에
+        # 녹화된 패킷을 복호할 수 없다 (전방향 안전성). 캐시도 키와 함께 지워지므로 무한히 커지지 않는다.
+        self.epoch_keys: dict[int, tuple[bytes, bytes]] = {}
+        self.replays: dict[int, ReplayCache] = {}
+        self.rotate()
         self.pool = LinkPool(self)
         self.mailboxes: dict[bytes, Mailbox] = {}
         self.exit_service = exit_service
@@ -125,12 +131,30 @@ class Node:
             exit_service.node = self
         self.tasks: list[asyncio.Task] = []
         self.server = None
-        self.stats = {"in": 0, "relayed": 0, "delivered": 0, "dropped": 0, "replays": 0, "loops_sent": 0}
+        self.stats = {"in": 0, "relayed": 0, "delivered": 0, "dropped": 0, "replays": 0, "loops_sent": 0,
+                      "undecryptable": 0, "loops_absorbed": 0}
 
     # ------------------------------------------------------------ 수명주기
+    def rotate(self) -> bool:
+        """현재·다음 epoch 키를 준비하고, 이전 epoch(유예 1)보다 오래된 키와 캐시를 지운다."""
+        e = D.current_epoch()
+        changed = False
+        for x in (e, e + 1):
+            if x not in self.epoch_keys:
+                self.epoch_keys[x] = C.x25519_keygen()
+                self.replays[x] = ReplayCache()
+                changed = True
+        for x in [x for x in self.epoch_keys if x < e - 1]:
+            del self.epoch_keys[x]          # 파이썬에서 메모리 소거는 최선 노력에 그친다
+            self.replays.pop(x, None)
+            changed = True
+        return changed
+
     def descriptor(self) -> Descriptor:
         policy = self.exit_service.policy() if self.exit_service else {}
-        return Descriptor.create(self.keys, self.role, self.public_host, self.port, policy)
+        e = D.current_epoch()
+        epochs = {x: self.epoch_keys[x][1] for x in (e, e + 1) if x in self.epoch_keys}
+        return Descriptor.create(self.keys, self.role, self.public_host, self.port, policy, epochs)
 
     async def start(self):
         self.server = await asyncio.start_server(self._on_conn, self.host, self.port)
@@ -157,13 +181,18 @@ class Node:
             log.warning("%s: consensus fetch failed: %s", self.name, e)
 
     async def _maintenance(self):
-        n = 0
+        last_refresh = last_register = 0.0
         while True:
-            await self.refresh()
-            await asyncio.sleep(2 if not (self.consensus and self.consensus.usable()) else 60)
-            n += 1
-            if n % 5 == 0:
+            now = time.time()
+            rotated = self.rotate()
+            if rotated or now - last_register > 300:
                 await register(self.authorities, self.descriptor())
+                last_register = now
+            interval = min(60.0, max(1.0, D.EPOCH_LEN / 4))
+            if rotated or not (self.consensus and self.consensus.usable()) or now - last_refresh > interval:
+                await self.refresh()
+                last_refresh = now
+            await asyncio.sleep(min(2.0, max(0.25, D.EPOCH_LEN / 8)))
 
     # ------------------------------------------------------------ 수신
     async def _on_conn(self, r: asyncio.StreamReader, w: asyncio.StreamWriter):
@@ -179,8 +208,14 @@ class Node:
                 ftype, body = await link.recv()
                 if ftype == W.F_PACKET:
                     self.on_packet(body[: S.PACKET_LEN])
+                elif ftype == W.F_FORWARD and self.role == "gateway" and mailbox_id is not None:
+                    # 네이티브 서비스가 SURB로 응답할 때: 서비스 IP가 믹스에 드러나지 않게 게이트웨이가 대신 보낸다
+                    target, pkt = body[:16], body[16:16 + S.PACKET_LEN]
+                    self.stats["relayed"] += 1
+                    asyncio.create_task(self.pool.send(target, pkt))
                 elif ftype == W.F_REGISTER and self.role == "gateway":
-                    mailbox_id = body[:16]
+                    # 비밀값 증명: 공개된 우편함 id(예: 서비스 intro)만으로는 남의 우편함을 가로챌 수 없다
+                    mailbox_id = W.mailbox_id(body[:32])
                     mb = self.mailboxes.setdefault(mailbox_id, Mailbox())
                     mb.link = link
                     self.tasks.append(asyncio.create_task(self._downstream(mailbox_id, mb, link)))
@@ -194,13 +229,20 @@ class Node:
 
     def on_packet(self, packet: bytes):
         self.stats["in"] += 1
-        try:
-            p = S.process_packet(self.keys.sphinx_sk, packet)
-        except S.SphinxError as e:
-            self.stats["dropped"] += 1
-            log.debug("%s: drop: %s", self.name, e)
+        e = D.current_epoch()
+        p = epoch = None
+        # 헤더에 epoch 표시가 없으므로(연결 가능성 방지) 가진 키를 차례로 시도한다. MAC이 맞는 키는 하나뿐이다.
+        for x in sorted(self.epoch_keys, key=lambda x: (x != e, -x)):
+            try:
+                p = S.process_packet(self.epoch_keys[x][0], packet)
+                epoch = x
+                break
+            except S.SphinxError:
+                continue
+        if p is None:
+            self.stats["undecryptable"] += 1      # 키가 없음(만료·위조) 또는 MAC 불일치
             return
-        if self.replay.seen(p.tag):
+        if self.replays[epoch].seen(p.tag):
             self.stats["replays"] += 1
             return
         r = p.routing
@@ -210,6 +252,9 @@ class Node:
         elif r.flag == S.DELIVER_EXIT and self.exit_service is not None:
             self.stats["delivered"] += 1
             self.exit_service.on_payload(p.payload)
+        elif r.flag == S.DELIVER_ENDPOINT and self.exit_service is not None:
+            self.stats["delivered"] += 1
+            self.exit_service.on_endpoint_payload(p.payload)
         elif r.flag == S.DELIVER_MAILBOX and self.role == "gateway":
             if r.target not in self.mailboxes and len(self.mailboxes) >= MAX_MAILBOXES:
                 self.stats["dropped"] += 1
@@ -217,7 +262,9 @@ class Node:
             self.stats["delivered"] += 1
             mb = self.mailboxes.setdefault(r.target, Mailbox())
             mb.put(W.pack_deliver(r.extra[: S.SURB_ID_LEN], p.payload))
-        else:      # FINAL_DROP / 잘못된 역할
+        elif r.flag == S.FINAL_DROP:
+            self.stats["loops_absorbed"] += 1       # 노드 루프 커버가 제자리로 돌아옴
+        else:      # 잘못된 역할
             self.stats["dropped"] += 1
 
     def _forward(self, node_id: bytes, packet: bytes):
@@ -257,7 +304,7 @@ class Node:
             if me is None:
                 continue
             path = [random.choice(c.layer(i)) for i in range(3)] + [me]
-            hops = [S.Hop(d.node_id, d.sphinx_pk) for d in path]
+            hops = [S.Hop(d.node_id, d.sphinx_key()) for d in path]
             routes = [S.Routing(S.RELAY, int(random.expovariate(1 / 50)), path[i + 1].node_id, b"")
                       for i in range(3)] + [S.Routing(S.FINAL_DROP, 0, b"", b"")]
             pkt, _ = S.create_packet(hops, routes, b"")
