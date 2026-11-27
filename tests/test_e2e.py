@@ -59,8 +59,12 @@ def test_end_to_end():
             await socks.start()
             br = BrowserServer(("127.0.0.1", 17390), "127.0.0.1", 17391, c, asyncio.get_running_loop())
             br.start()
-            url = br.url + "view?u=" + urllib.parse.quote(f"http://127.0.0.1:{wport}/", safe="")
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            # HTTPS 전용 모드: 평문 HTTP는 확인 페이지로 막힌다
+            url = br.url + "view?u=" + urllib.parse.quote(f"http://127.0.0.1:{wport}/", safe="")
+            blocked = await asyncio.to_thread(lambda: opener.open(url, timeout=60).read().decode())
+            assert "HTTPS 전용 모드" in blocked and "hidden service ok" not in blocked
+            url += "&ok=1"
             html, hdrs = await asyncio.to_thread(lambda: (lambda r: (r.read().decode(), r.headers))(
                 opener.open(url, timeout=60)))
             assert "hidden service ok" in html

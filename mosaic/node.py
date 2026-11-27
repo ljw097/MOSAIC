@@ -179,6 +179,11 @@ class Node:
                 ftype, body = await link.recv()
                 if ftype == W.F_PACKET:
                     self.on_packet(body[: S.PACKET_LEN])
+                elif ftype == W.F_FORWARD and self.role == "gateway" and mailbox_id is not None:
+                    # 네이티브 서비스가 SURB로 응답할 때: 서비스 IP가 믹스에 드러나지 않게 게이트웨이가 대신 보낸다
+                    target, pkt = body[:16], body[16:16 + S.PACKET_LEN]
+                    self.stats["relayed"] += 1
+                    asyncio.create_task(self.pool.send(target, pkt))
                 elif ftype == W.F_REGISTER and self.role == "gateway":
                     mailbox_id = body[:16]
                     mb = self.mailboxes.setdefault(mailbox_id, Mailbox())

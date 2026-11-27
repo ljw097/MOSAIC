@@ -50,7 +50,7 @@ R → I : e_R(32) ‖ HMAC(k_c, "responder-confirm")
 k_ir ‖ k_ri ‖ k_c = HKDF(DH(e_I,S_R) ‖ ss_kem ‖ DH(e_I,e_R), "MOSAIC link v1" ‖ H(transcript))
 ```
 
-이후 모든 프레임은 `AEAD(type(1) ‖ body ‖ zero-pad) = 2456B`로 길이가 고정된다.
+이후 모든 프레임은 평문 2456B(`type(1) ‖ body ‖ zero-pad`), 암호문 2472B로 길이가 고정된다.
 
 | type | 의미 |
 |---|---|
@@ -58,6 +58,7 @@ k_ir ‖ k_ri ‖ k_c = HKDF(DH(e_I,S_R) ‖ ss_kem ‖ DH(e_I,e_R), "MOSAIC lin
 | 2 DELIVER | 게이트웨이 → 클라이언트: `surb_id(8) ‖ payload(2048)` |
 | 3 REGISTER | 클라이언트 → 게이트웨이: `mailbox_id(16)` |
 | 4 DUMMY | 커버 |
+| 5 FORWARD | 클라이언트/서비스 → 게이트웨이: `target(16) ‖ packet` (SURB 응답 대리 전송) |
 
 ## 4. 마름모 분할 계층 (SSMS)
 
@@ -91,7 +92,30 @@ FRAGMENT (Sphinx 본문, ≤2032B) = 0xF5 ‖ msg_id(16) ‖ idx(1) ‖ k(1) ‖
 - 흐름 제어: 출구는 SURB 묶음이 있을 때만 TCP에서 읽는다. 그래서 클라이언트가 미리 건넨 묶음 수(window)가
   곧 하향 혼잡 창이다.
 
-## 6. 트래픽 스케줄링
+## 6. 네이티브 서비스 (.mosaic)
+
+- 주소: `base32(H("mosaic-service", identity_pk)[:20]) + ".mosaic"`. 자기 인증 주소다.
+- 서비스 기술자 `{address, identity_pk, x25519_pk, mlkem_pk, intros[(gateway_id, mailbox_id)], published}`를
+  Ed25519로 서명한다. 권한 서버는 이것을 합의 문서의 `services`에 실을 뿐이다. 클라이언트가 주소와 서명을
+  직접 검증하므로 권한 서버를 믿을 필요가 없다. 조회도 합의 문서 전체를 받는 방식이라 어떤 서비스를 찾는지 드러나지 않는다.
+- 정방향: 조각 i는 `client G_i → L1 → L2 → L3 → intro_gateway_(i mod m)`로 간다. 최종 지시는
+  `DELIVER_MAILBOX(intro mailbox)`이다. 서비스가 조각을 모아 SSMS를 풀고 E2E를 연다.
+- E2E (`mosaic/e2e.py`):
+  ```
+  INIT = 0xE1 ‖ conn(16) ‖ nonce(12) ‖ e_c(32) ‖ ML-KEM ct(1088) ‖ AEAD(k_up, cell)
+  UP   = 0xE2 ‖ conn ‖ nonce ‖ AEAD(k_up, cell)      DOWN = 0xE3 ‖ conn ‖ nonce ‖ AEAD(k_down, cell)
+  k_up ‖ k_down = HKDF(X25519(e_c, S) ‖ ss_kem, "MOSAIC e2e v1" ‖ conn ‖ e_c ‖ H(ct) ‖ S)
+  ```
+  conn은 셀 세션 id와 같아야 한다. INIT보다 먼저 도착한 UP은 최대 64개까지 버퍼에 둔다.
+- 응답: 서비스는 SURB 패킷을 자기 게이트웨이로 보낸다 (링크 프레임 `F_FORWARD = target(16) ‖ packet`).
+  게이트웨이가 대신 첫 홉에 전달하므로 믹스는 서비스 IP를 알 수 없다.
+
+## 7. 브라우저 HTTPS 전용 정책
+
+일반 인터넷은 `https://`만 쓴다. 평문 `http://`는 확인 페이지를 거쳐야 하고(`ok=1`), HTTPS→HTTP 리다이렉트와
+HTTP 하위 리소스는 차단한다. `.mosaic`은 E2E 터널 안이므로 `http://`를 허용한다.
+
+## 8. 트래픽 스케줄링
 
 - 클라이언트: 게이트웨이 링크마다 독립적으로, `Exp(λ_P)` 간격마다 큐에 실제 메시지가 있으면 보내고, 없으면 DROP 커버를 보낸다.
   이와 별도로 `Exp(λ_L)` 간격으로 루프를, `Exp(λ_D)` 간격으로 드롭을 보낸다.
@@ -99,7 +123,7 @@ FRAGMENT (Sphinx 본문, ≤2032B) = 0xF5 ‖ msg_id(16) ‖ idx(1) ‖ k(1) ‖
 - 믹스/게이트웨이 노드: `Exp(λ_M)` 간격으로 L1→L2→L3→자신 경로의 루프를 보낸다.
 - 홉 지연은 송신자가 `Exp(1/μ)`에서 뽑는다. 노드는 최대 30초로 자른다.
 
-## 7. 디렉터리
+## 9. 디렉터리
 
 - 기술자: `{node_id = H(identity_pk)[:16], role, host, port, identity/sphinx/link/mlkem 공개키,
   published, exit_policy}`를 Ed25519로 서명한다.

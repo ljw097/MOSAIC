@@ -24,7 +24,7 @@ from . import crypto as C
 from .sphinx import PACKET_LEN
 
 MAGIC = b"MOSAIC/1"
-FRAME_PT = 1 + PACKET_LEN + 7          # 2440
+FRAME_PT = 1 + 16 + PACKET_LEN + 7     # 2456 (F_FORWARD가 가장 큼)
 FRAME_CT = FRAME_PT + 16
 
 # 프레임 타입
@@ -32,6 +32,7 @@ F_PACKET = 1      # Sphinx 패킷
 F_DELIVER = 2     # 게이트웨이 -> 클라이언트: surb_id(8) || payload(2048)
 F_REGISTER = 3    # 클라이언트 -> 게이트웨이: mailbox id(16)
 F_DUMMY = 4       # 링크 커버 트래픽
+F_FORWARD = 5     # 클라이언트(서비스) -> 게이트웨이: target(16) || SURB 패킷. 게이트웨이가 대신 첫 홉으로 전달
 
 
 class LinkError(Exception):
@@ -123,4 +124,4 @@ def unpack_deliver(body: bytes) -> tuple[bytes, bytes]:
     return body[:SURB_ID_LEN], body[SURB_ID_LEN:SURB_ID_LEN + PAYLOAD_LEN]
 
 
-__all__ = ["Link", "connect", "accept", "F_PACKET", "F_DELIVER", "F_REGISTER", "F_DUMMY", "struct"]
+__all__ = ["Link", "connect", "accept", "F_PACKET", "F_DELIVER", "F_REGISTER", "F_DUMMY", "F_FORWARD", "struct"]

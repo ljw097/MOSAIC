@@ -130,12 +130,95 @@ class Descriptor:
         return C.h(canonical(self.to_json())).hex()
 
 
+# ---------------------------------------------------------------- 서비스 기술자
+SERVICE_TTL = 3600
+
+
+@dataclass
+class ServiceKeys:
+    identity_sk: bytes
+    identity_pk: bytes
+    x25519_sk: bytes
+    x25519_pk: bytes
+    mlkem_seed: bytes
+    mlkem_pk: bytes
+
+    @property
+    def address(self) -> str:
+        from .e2e import service_address
+        return service_address(self.identity_pk)
+
+    @classmethod
+    def generate(cls) -> "ServiceKeys":
+        isk, ipk = C.ed_keygen()
+        xsk, xpk = C.x25519_keygen()
+        ms, mp = C.mlkem_keygen()
+        return cls(isk, ipk, xsk, xpk, ms, mp)
+
+    @classmethod
+    def load_or_create(cls, path: str) -> "ServiceKeys":
+        import os
+        if os.path.exists(path):
+            with open(path) as f:
+                d = json.load(f)
+            return cls(**{k: bytes.fromhex(d[k]) for k in cls.__dataclass_fields__})
+        k = cls.generate()
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({f_: getattr(k, f_).hex() for f_ in cls.__dataclass_fields__}, f)
+        return k
+
+
+@dataclass
+class ServiceDescriptor:
+    """네이티브 서비스 기술자. 주소 = H(identity_pk)이므로 자기 인증된다. 권한 서버를 믿을 필요가 없다.
+    intros: 서비스가 조각을 받는 (게이트웨이 id, 우편함 id) 목록. 마름모의 오른쪽 꼭짓점을 넓히는 데 쓴다."""
+    address: str
+    identity_pk: bytes
+    x25519_pk: bytes
+    mlkem_pk: bytes
+    intros: list[tuple[bytes, bytes]]
+    published: int
+    sig: bytes = b""
+
+    def body(self) -> dict:
+        return {"address": self.address, "identity_pk": self.identity_pk.hex(), "x25519_pk": self.x25519_pk.hex(),
+                "mlkem_pk": self.mlkem_pk.hex(), "intros": [[g.hex(), m.hex()] for g, m in self.intros],
+                "published": self.published}
+
+    def to_json(self) -> dict:
+        d = self.body()
+        d["sig"] = self.sig.hex()
+        return d
+
+    @classmethod
+    def from_json(cls, d: dict) -> "ServiceDescriptor":
+        return cls(d["address"], bytes.fromhex(d["identity_pk"]), bytes.fromhex(d["x25519_pk"]),
+                   bytes.fromhex(d["mlkem_pk"]), [(bytes.fromhex(g), bytes.fromhex(m)) for g, m in d["intros"]],
+                   int(d["published"]), bytes.fromhex(d.get("sig", "")))
+
+    @classmethod
+    def create(cls, keys: ServiceKeys, intros: list[tuple[bytes, bytes]]) -> "ServiceDescriptor":
+        d = cls(keys.address, keys.identity_pk, keys.x25519_pk, keys.mlkem_pk, intros, int(time.time()))
+        d.sig = C.ed_sign(keys.identity_sk, b"MOSAIC-svc" + canonical(d.body()))
+        return d
+
+    def verify(self) -> bool:
+        from .e2e import service_address
+        if self.address != service_address(self.identity_pk) or not self.intros or len(self.intros) > 16:
+            return False
+        if len(self.x25519_pk) != 32 or len(self.mlkem_pk) != C.MLKEM_PK_LEN:
+            return False
+        return C.ed_verify(self.identity_pk, self.sig, b"MOSAIC-svc" + canonical(self.body()))
+
+
 # ---------------------------------------------------------------- 권한 서버
 class Authority:
     def __init__(self, sk: bytes, host: str, port: int):
         self.sk, self.pk = sk, C.ed25519.Ed25519PrivateKey.from_private_bytes(sk).public_key().public_bytes_raw()
         self.host, self.port = host, port
         self.descs: dict[bytes, Descriptor] = {}
+        self.services: dict[str, ServiceDescriptor] = {}
         self.server: asyncio.base_events.Server | None = None
 
     async def start(self):
@@ -156,6 +239,14 @@ class Authority:
                     if old is None or old.published <= d.published:
                         self.descs[d.node_id] = d
                 resp = {"ok": ok}
+            elif req.get("op") == "publish_service":
+                d = ServiceDescriptor.from_json(req["descriptor"])
+                ok = d.verify() and abs(time.time() - d.published) < 600 and len(self.services) < 100_000
+                if ok:
+                    old = self.services.get(d.address)
+                    if old is None or old.published <= d.published:
+                        self.services[d.address] = d
+                resp = {"ok": ok}
             elif req.get("op") == "consensus":
                 resp = self.signed_document()
             else:
@@ -171,7 +262,11 @@ class Authority:
         now = time.time()
         descs = sorted((d for d in self.descs.values() if now - d.published < DESCRIPTOR_TTL),
                        key=lambda d: d.node_id)
-        doc = {"epoch": int(now // EPOCH_LEN), "descriptors": [d.to_json() for d in descs]}
+        svcs = sorted((d for d in self.services.values() if now - d.published < SERVICE_TTL),
+                      key=lambda d: d.address)
+        # 서비스 기술자는 합의 문서에 통째로 싣는다 → 조회해도 권한 서버는 어떤 서비스를 찾는지 모른다
+        doc = {"epoch": int(now // EPOCH_LEN), "descriptors": [d.to_json() for d in descs],
+               "services": [d.to_json() for d in svcs]}
         return {"authority": self.pk.hex(), "doc": doc,
                 "sig": C.ed_sign(self.sk, b"MOSAIC-consensus" + canonical(doc)).hex()}
 
@@ -185,6 +280,17 @@ async def _request(host: str, port: int, req: dict, timeout: float = 10) -> dict
         return json.loads(line)
     finally:
         w.close()
+
+
+async def publish_service(authorities: list[tuple[str, int, bytes]], desc: ServiceDescriptor) -> int:
+    ok = 0
+    for host, port, _pk in authorities:
+        try:
+            resp = await _request(host, port, {"op": "publish_service", "descriptor": desc.to_json()})
+            ok += bool(resp.get("ok"))
+        except Exception as e:     # noqa: BLE001
+            log.warning("publish_service at %s:%d failed: %s", host, port, e)
+    return ok
 
 
 async def register(authorities: list[tuple[str, int, bytes]], desc: Descriptor) -> int:
@@ -203,6 +309,7 @@ async def register(authorities: list[tuple[str, int, bytes]], desc: Descriptor) 
 class Consensus:
     epoch: int
     nodes: dict[bytes, Descriptor]
+    services: dict[str, ServiceDescriptor] = field(default_factory=dict)
 
     def by_role(self, role: str) -> list[Descriptor]:
         return [d for d in self.nodes.values() if d.role == role]
@@ -226,6 +333,7 @@ def build_consensus(documents: list[dict], authority_pks: list[bytes], threshold
     epochs: Counter[int] = Counter()
     trusted = {pk.hex() for pk in authority_pks}
     voted: set[str] = set()
+    services: dict[str, ServiceDescriptor] = {}
     for doc in documents:
         a = doc.get("authority", "")
         if a not in trusted or a in voted:
@@ -236,6 +344,13 @@ def build_consensus(documents: list[dict], authority_pks: list[bytes], threshold
             continue
         voted.add(a)
         epochs[doc["doc"]["epoch"]] += 1
+        for sj in doc["doc"].get("services", []):
+            try:
+                sd = ServiceDescriptor.from_json(sj)
+            except Exception:     # noqa: BLE001
+                continue
+            if sd.verify() and (sd.address not in services or services[sd.address].published < sd.published):
+                services[sd.address] = sd
         for dj in doc["doc"]["descriptors"]:
             d = Descriptor.from_json(dj)
             if not d.verify():
@@ -251,7 +366,7 @@ def build_consensus(documents: list[dict], authority_pks: list[bytes], threshold
             d = seen[dg]
             if d.node_id not in nodes or nodes[d.node_id].published < d.published:
                 nodes[d.node_id] = d
-    c = Consensus(epochs.most_common(1)[0][0], nodes)
+    c = Consensus(epochs.most_common(1)[0][0], nodes, services)
     c.assign_layers()
     return c
 

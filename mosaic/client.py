@@ -33,10 +33,11 @@ import time
 from dataclasses import dataclass
 
 from . import cells as K
+from . import e2e as E
 from . import sphinx as S
 from . import split as P
 from . import wire as W
-from .directory import Consensus, Descriptor, fetch_consensus
+from .directory import Consensus, Descriptor, ServiceDescriptor, fetch_consensus
 
 log = logging.getLogger("mosaic.client")
 
@@ -82,6 +83,14 @@ def disjoint_paths(consensus: Consensus, n: int, rng=random) -> list[list[Descri
     return [[cols[l][i] for l in range(3)] for i in range(n)]
 
 
+@dataclass
+class ServiceDest:
+    """네이티브 서비스 목적지. 마름모의 오른쪽 꼭짓점이 출구가 아니라 서비스 자신이다.
+    조각들은 서비스의 여러 intro 게이트웨이로 나뉘어 들어간다."""
+    desc: ServiceDescriptor
+    intros: list[tuple[Descriptor, bytes]]
+
+
 class Lane:
     """게이트웨이 하나와의 링크. 자기만의 우편함 id, 송신 큐, Poisson 과정을 가진다."""
 
@@ -89,13 +98,15 @@ class Lane:
         self.gateway = gateway
         self.mailbox = os.urandom(16)     # 게이트웨이마다 다른 id → 게이트웨이끼리 공모해도 연결 불가
         self.link: W.Link | None = None
-        self.queue: asyncio.Queue[bytes] = asyncio.Queue()
+        self.queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
         self.tasks: list[asyncio.Task] = []
 
 
 class MStream:
-    def __init__(self, client: "MosaicClient", exit_desc: Descriptor, sid: bytes):
-        self.c, self.exit, self.sid = client, exit_desc, sid
+    def __init__(self, client: "MosaicClient", dest, sid: bytes, e2e: E.ClientSession | None = None):
+        self.c, self.dest, self.sid = client, dest, sid
+        self.e2e = e2e
+        self.overhead = E.OVERHEAD if e2e else 0
         self.up_seq = 0
         self.down_next = 0
         self.down_pending: dict[int, K.Cell] = {}
@@ -108,11 +119,18 @@ class MStream:
     def _send(self, t: int, data: bytes):
         cell = K.Cell(t, self.sid, self.up_seq, data)
         self.up_seq += 1
-        self.c._send_message(self.exit, cell.pack())
+        msg = cell.pack()
+        if self.e2e is not None:
+            msg = self.e2e.seal(msg)       # 서비스 키로 종단 간 암호화 (게이트웨이·믹스는 못 읽음)
+        self.c._send_message(self.dest, msg)
+
+    @property
+    def max_data(self) -> int:
+        return self.c.profile.max_cell_data - self.overhead
 
     def _supply_surbs(self, nsets: int):
         prof = self.c.profile
-        per = max(1, K.sets_per_cell(prof.split_k[0], prof.reply_n))
+        per = max(1, (self.max_data - 2) // (prof.reply_n * S.SURB_LEN))
         while nsets > 0:
             k = min(nsets, per)
             sets = [self.c._make_surb_set(self) for _ in range(k)]
@@ -146,7 +164,7 @@ class MStream:
 
     # ---------------------------------------------------------------- API
     async def write(self, data: bytes):
-        step = self.c.profile.max_cell_data
+        step = self.max_data
         for i in range(0, len(data), step):
             self._send(K.C_DATA, data[i:i + step])
         while self.c.backlog() > 1024:      # 역압
@@ -183,6 +201,7 @@ class MosaicClient:
         self.tasks: list[asyncio.Task] = []
         self.ready = asyncio.Event()
         self.path_log: list[list[list[bytes]]] | None = None     # 테스트/진단용
+        self.on_forward = None          # 서비스 호스트가 설정: 정방향 조각 처리기
         self.stats = {"sent_real": 0, "sent_cover": 0, "sent_loop": 0, "loops_back": 0,
                       "recv_real": 0, "recv_dummy": 0, "loop_rtt_ms": 0.0,
                       "messages_split": 0, "fragments_sent": 0, "messages_reassembled": 0}
@@ -287,8 +306,10 @@ class MosaicClient:
         pkt, _ = S.create_packet(hops, routes + [final_routing], body)
         return pkt
 
-    def _send_message(self, exit_desc: Descriptor, msg: bytes):
-        """메시지 하나를 k-of-n으로 쪼개 마름모 경로로 보낸다."""
+    def _send_message(self, dest, msg: bytes):
+        """메시지 하나를 k-of-n으로 쪼개 마름모 경로로 보낸다.
+        dest가 출구(Descriptor)면 모든 조각이 그 출구에서 모인다. ServiceDest면 서비스의 intro
+        게이트웨이들로 나뉘어 들어가고 서비스 자신이 모은다 (출구 없음)."""
         p = self.profile
         k = random.randint(*p.split_k)
         k = max(k, -(-(len(msg) + P.TAG_LEN) // P.FRAG_CAP))      # 너무 크면 k를 키운다
@@ -298,10 +319,15 @@ class MosaicClient:
         lanes = self._lanes_for(n)
         if self.path_log is not None:
             self.path_log.append([[l.gateway.node_id] + [m.node_id for m in mp] for l, mp in zip(lanes, paths)])
-        for frag, mixes, lane in zip(frags, paths, lanes):
-            pkt = self._forward_packet(lane.gateway, mixes, exit_desc,
-                                       S.Routing(S.DELIVER_EXIT, 0, b"", b""), frag.pack())
-            lane.queue.put_nowait(pkt)
+        for i, (frag, mixes, lane) in enumerate(zip(frags, paths, lanes)):
+            if isinstance(dest, ServiceDest):
+                gw, mailbox = dest.intros[i % len(dest.intros)]
+                pkt = self._forward_packet(lane.gateway, mixes, gw,
+                                           S.Routing(S.DELIVER_MAILBOX, 0, mailbox, b"\0" * 8), frag.pack())
+            else:
+                pkt = self._forward_packet(lane.gateway, mixes, dest,
+                                           S.Routing(S.DELIVER_EXIT, 0, b"", b""), frag.pack())
+            lane.queue.put_nowait((W.F_PACKET, pkt))
         self.stats["messages_split"] += 1
         self.stats["fragments_sent"] += n
 
@@ -321,9 +347,9 @@ class MosaicClient:
         return out
 
     # ------------------------------------------------------------ 송신 (Poisson)
-    async def _transmit(self, lane: Lane, pkt: bytes):
+    async def _transmit(self, lane: Lane, pkt: bytes, ftype: int = W.F_PACKET):
         try:
-            await lane.link.send(W.F_PACKET, pkt)
+            await lane.link.send(ftype, pkt)
         except Exception:      # noqa: BLE001
             lane.link.close()
             await self._reconnect(lane)
@@ -332,9 +358,9 @@ class MosaicClient:
         while True:
             await asyncio.sleep(random.expovariate(self.profile.rate_payload))
             try:
-                pkt = lane.queue.get_nowait()
+                ftype, pkt = lane.queue.get_nowait()
                 self.stats["sent_real"] += 1
-                await self._transmit(lane, pkt)
+                await self._transmit(lane, pkt, ftype)
             except asyncio.QueueEmpty:
                 await self._send_drop(lane)
 
@@ -382,6 +408,8 @@ class MosaicClient:
             return
         entry = self.surb_keys.pop(surb_id, None)
         if entry is None:
+            if self.on_forward is not None:     # 서비스 모드: 정방향 조각 수신
+                self.on_forward(payload)
             return
         keys, stream, _ = entry
         try:
@@ -396,8 +424,10 @@ class MosaicClient:
         if msg is None:
             return
         try:
+            if stream.e2e is not None:
+                msg = stream.e2e.open(msg)
             cell = K.Cell.unpack(msg)
-        except ValueError:
+        except (ValueError, E.E2EError):
             return
         self.stats["messages_reassembled"] += 1
         if cell.session == stream.sid:
@@ -407,6 +437,21 @@ class MosaicClient:
         self.streams.pop(stream.sid, None)
 
     # ------------------------------------------------------------ 공개 API
+    async def _service_dest(self, address: str) -> ServiceDest:
+        d = self.consensus.services.get(address)
+        if d is None:       # 막 게시된 서비스일 수 있다 → 합의를 한 번 새로 받는다
+            c = await fetch_consensus(self.authorities, self.threshold)
+            if c.usable():
+                self.consensus = c
+            d = self.consensus.services.get(address)
+        if d is None:
+            raise StreamError(f"unknown service {address}")
+        intros = [(self.consensus.nodes[g], m) for g, m in d.intros
+                  if g in self.consensus.nodes and self.consensus.nodes[g].role == "gateway"]
+        if not intros:
+            raise StreamError("service has no reachable intro gateway")
+        return ServiceDest(d, intros)
+
     def exit_for_key(self, isolation: str) -> Descriptor:
         exits = self.consensus.by_role("exit")
         d = self.exit_for.get(isolation)
@@ -420,11 +465,15 @@ class MosaicClient:
 
     async def open_stream(self, host: str, port: int, isolation: str = "", timeout: float = 60) -> MStream:
         await self.ready.wait()
-        exit_desc = self.exit_for_key(isolation or host)
-        st = MStream(self, exit_desc, os.urandom(16))
+        sid = os.urandom(16)
+        if host.lower().endswith(".mosaic"):
+            dest = await self._service_dest(host.lower())
+            st = MStream(self, dest, sid, E.ClientSession(sid, dest.desc.x25519_pk, dest.desc.mlkem_pk))
+        else:
+            st = MStream(self, self.exit_for_key(isolation or host), sid)
         self.streams[st.sid] = st
-        st._supply_surbs(self.profile.window)
         st._send(K.C_OPEN, json.dumps({"host": host, "port": port, "reply_k": self.profile.reply_k}).encode())
+        st._supply_surbs(self.profile.window)
         try:
             await asyncio.wait_for(asyncio.shield(st.connected), timeout)
         except asyncio.TimeoutError as e:

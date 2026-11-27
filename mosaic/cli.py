@@ -131,6 +131,49 @@ def cmd_client(args):
     asyncio.run(main())
 
 
+def cmd_serve(args):
+    from .directory import ServiceKeys
+    from .service import ServiceHost
+
+    async def main():
+        keys = ServiceKeys.load_or_create(args.key)
+        host = ServiceHost(keys, parse_authorities(args.authority), args.threshold, _hostport(args.target),
+                           args.profile)
+        await host.start()
+        print(f"[mosaic] 서비스 주소: http://{host.address}/  →  {args.target}", flush=True)
+        await _forever()
+        await host.stop()
+    asyncio.run(main())
+
+
+async def _demo_service(authorities, threshold):
+    """테스트망용 데모 .mosaic 서비스: 출구 없이 E2E로 도달하는 작은 웹사이트."""
+    from .directory import ServiceKeys
+    from .service import ServiceHost
+
+    async def web(r, w):
+        try:
+            await r.readuntil(b"\r\n\r\n")
+        except Exception:      # noqa: BLE001
+            w.close()
+            return
+        body = ("<!doctype html><html lang=ko><meta charset=utf-8><title>MOSAIC 데모 서비스</title>"
+                "<body style='font:16px system-ui;max-width:640px;margin:40px auto'>"
+                "<h1>◇ 출구 없는 통신</h1><p>이 페이지는 <b>.mosaic</b> 네이티브 서비스에서 왔습니다.</p>"
+                "<ul><li>출구 노드가 없습니다. 조각들이 서비스 자신에게서 다시 모입니다.</li>"
+                "<li>종단 간 암호화(X25519 + ML-KEM-768). 게이트웨이와 믹스는 조각을 모아도 읽지 못합니다.</li>"
+                "<li>서비스는 당신이 누구인지 모르고, 당신은 서비스의 IP를 모릅니다.</li></ul></body></html>").encode()
+        w.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+        await w.drain()
+        w.close()
+
+    srv = await asyncio.start_server(web, "127.0.0.1", 0)
+    host = ServiceHost(ServiceKeys.generate(), authorities, threshold, srv.sockets[0].getsockname()[:2])
+    await host.start()
+    return host
+
+
 def cmd_testnet(args):
     from .testnet import start_testnet
 
@@ -141,8 +184,11 @@ def cmd_testnet(args):
         print("[mosaic] 테스트망 준비 완료. 권한 서버:", flush=True)
         for s in tn.authority_strings():
             print("    --authority", s, flush=True)
+        demo = await _demo_service(tn.authority_specs, tn.threshold)
+        print(f"[mosaic] 데모 .mosaic 서비스: http://{demo.address}/", flush=True)
         client, _s, browser, proc = await _run_client_stack(args, tn.authority_specs, tn.threshold)
         await _forever()
+        await demo.stop()
         if proc:
             proc.terminate()
         await client.stop()
@@ -194,6 +240,13 @@ def main(argv=None):
     add_auth(c)
     add_client(c)
     c.set_defaults(fn=cmd_client)
+
+    sv = sub.add_parser("serve", help="로컬 서버를 .mosaic 네이티브 서비스로 게시 (출구 없음, E2E)")
+    sv.add_argument("--key", required=True)
+    sv.add_argument("--target", required=True, help="host:port (예: 127.0.0.1:8080)")
+    sv.add_argument("--profile", choices=sorted(PROFILES), default="interactive")
+    add_auth(sv)
+    sv.set_defaults(fn=cmd_serve)
 
     t = sub.add_parser("testnet", help="로컬 테스트망 + 클라이언트 + 브라우저를 한 번에 실행")
     t.add_argument("--base-port", type=int, default=17000)

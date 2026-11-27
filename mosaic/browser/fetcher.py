@@ -128,11 +128,13 @@ class _Conn(http.client.HTTPConnection):
 
 def fetch(proxy: tuple[str, int], url: str, isolation: str, jar: CookieJar | None = None, top: str = "",
           method: str = "GET", body: bytes | None = None, extra: dict | None = None,
-          timeout: float = 120, max_redirects: int = 8) -> Response:
+          timeout: float = 120, max_redirects: int = 8, allow_insecure: bool = False) -> Response:
     for _ in range(max_redirects + 1):
         sp = urlsplit(url)
         if sp.scheme not in ("http", "https") or not sp.hostname:
             raise FetchError("unsupported URL")
+        if sp.scheme == "http" and not sp.hostname.endswith(".mosaic") and not allow_insecure:
+            raise FetchError(f"HTTPS 전용 모드: 평문 HTTP로 가는 요청/리다이렉트를 막았습니다 ({url})")
         port = sp.port or (443 if sp.scheme == "https" else 80)
         conn = _Conn(sp.hostname, port, proxy, isolation, timeout, sp.scheme == "https")
         headers = dict(UNIFORM_HEADERS)

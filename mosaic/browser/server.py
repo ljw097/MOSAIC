@@ -5,7 +5,8 @@ http://127.0.0.1:8118/<token>/ 을 열면 된다.
 - 스크립트는 실행되지 않는다 (정화 + CSP script-src 'none'). WebRTC·Canvas·폰트 열거 같은
   JS 기반 지문채취와 IP 누출이 원천적으로 막힌다.
 - 같은 User-Agent, 같은 Accept-*, Referer 없음. 모든 사용자의 요청이 똑같아 보인다.
-- HTTPS를 먼저 시도한다. 평문 HTTP로 내려가면 경고 띠를 표시한다.
+- HTTPS 전용이다. 평문 HTTP는 사용자가 매번 확인해야 하고, HTTPS→HTTP 리다이렉트와 HTTP 하위 리소스는 막는다.
+- .mosaic 주소는 출구 없이 서비스까지 E2E로 간다.
 - 무작위 토큰이 경로에 들어간다. 같은 컴퓨터의 다른 웹페이지가 이 프록시를 악용(CSRF)
   하기 어렵다.
 """
@@ -38,6 +39,12 @@ PASS_TYPES = ("image/", "font/", "audio/", "video/", "text/plain", "application/
               "application/x-font", "application/vnd.ms-fontobject")
 MULTI_SUFFIX = {"co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "co.uk", "org.uk", "ac.uk", "co.jp",
                 "ne.jp", "or.jp", "com.au", "net.au", "com.cn", "com.br", "co.in", "github.io"}
+
+
+def is_secure(url: str) -> bool:
+    """출구 노드가 내용을 읽을 수 없는 URL인가: HTTPS(종단 TLS) 또는 .mosaic(종단 E2E, 출구 없음)."""
+    sp = urlsplit(url)
+    return sp.scheme == "https" or (sp.hostname or "").endswith(".mosaic")
 
 
 def site_of(host: str) -> str:
@@ -173,7 +180,7 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/":
                 self._home()
             elif route == "/view" and "u" in q:
-                self._view(q["u"], method="GET")
+                self._view(q["u"], method="GET", ok=q.get("ok") == "1")
             elif route == "/res" and "u" in q:
                 self._res(q["u"], q.get("top", ""))
             elif route == "/form":
@@ -196,7 +203,8 @@ class Handler(BaseHTTPRequestHandler):
 <ul>
 <li>JavaScript를 실행하지 않습니다. 지문채취와 WebRTC IP 누출이 원천적으로 막힙니다.</li>
 <li>사이트마다 출구와 쿠키 저장소가 따로라서, 사이트들이 서로 정보를 모아 당신을 추적할 수 없습니다.</li>
-<li>HTTPS를 먼저 시도합니다. 출구 노드도 내용을 볼 수 없습니다.</li>
+<li>HTTPS 전용입니다. 출구 노드도 내용을 볼 수 없습니다. 평문 HTTP는 매번 확인을 받습니다.</li>
+<li><code>.mosaic</code> 주소는 출구 노드 없이 상대 서버까지 종단 간 암호화(X25519+ML-KEM)로 갑니다.</li>
 </ul>
 <p>위 주소창에 주소를 입력하세요. 예: <code>example.com</code></p>""")
 
@@ -216,41 +224,54 @@ class Handler(BaseHTTPRequestHandler):
                          "<p>sent_cover/sent_loop: 커버 트래픽, recv_dummy: 게이트웨이가 보낸 더미 프레임 수.</p>")
 
     # ------------------------------------------------------------ 페이지
-    def _normalize(self, u: str) -> tuple[str, bool]:
+    def _normalize(self, u: str) -> str:
         u = u.strip()
-        if "://" not in u:
-            return "https://" + u, True        # HTTPS 우선, 실패 시 http 시도
-        return u, False
+        if "://" in u:
+            return u
+        host = u.split("/")[0].split(":")[0].lower()
+        # .mosaic은 E2E 터널 안이므로 http로 충분하다. 일반 인터넷은 HTTPS만 쓴다 (http로 자동 후퇴하지 않음)
+        return ("http://" if host.endswith(".mosaic") else "https://") + u
 
-    def _view(self, raw: str, method: str = "GET", body: bytes | None = None, ctype: str | None = None):
+    def _view(self, raw: str, method: str = "GET", body: bytes | None = None, ctype: str | None = None,
+              ok: bool = False):
         s = self.server_ref
-        url, guessed = self._normalize(raw)
+        url = self._normalize(raw)
         sp = urlsplit(url)
         if sp.scheme not in ("http", "https") or not sp.hostname:
             self._err("http/https 주소만 지원합니다.", 400, raw)
             return
+        if not is_secure(url) and not ok:
+            self._https_only(url, method)
+            return
         top = site_of(sp.hostname)
         extra = {"Content-Type": ctype} if ctype else None
         try:
-            r = fetch(s.socks, url, "site:" + top, s.jar, top, method, body, extra)
-        except (FetchError, OSError, Exception) as e:      # noqa: BLE001
-            if guessed:
-                try:
-                    url = "http://" + raw.strip()
-                    r = fetch(s.socks, url, "site:" + top, s.jar, top, method, body, extra)
-                except Exception as e2:      # noqa: BLE001
-                    self._err(f"{e2}", url=raw)
-                    return
-            else:
-                self._err(f"{type(e).__name__}: {e}", url=url)
-                return
+            r = fetch(s.socks, url, "site:" + top, s.jar, top, method, body, extra, allow_insecure=ok)
+        except Exception as e:      # noqa: BLE001
+            self._err(f"{type(e).__name__}: {e}", url=url)
+            return
         self._deliver(r, top)
+
+    def _https_only(self, url: str, method: str):
+        s = self.server_ref
+        https = "https://" + url.split("://", 1)[1]
+        go = f"{s.prefix}/view?u={quote(url, safe='')}&ok=1"
+        alt = f"{s.prefix}/view?u={quote(https, safe='')}"
+        proceed = (f'<p><a href="{html.escape(go)}">위험을 이해하고 HTTP로 계속</a></p>' if method == "GET" else "")
+        self._page("HTTPS 전용 모드", f"""
+<h2>HTTPS 전용 모드가 평문 HTTP를 막았습니다</h2>
+<p><code>{html.escape(url)}</code></p>
+<p>일반 인터넷 사이트는 마지막 구간을 출구 노드가 대신 연결합니다. HTTP는 암호화되지 않으므로 출구 노드를
+장악한 사람이 이 페이지의 내용, 입력하는 값, 쿠키를 모두 읽고 바꿀 수 있습니다. 누가 보냈는지는
+출구도 모르지만, 내용에 이름이나 계정이 들어 있으면 그것만으로 신원이 드러납니다.</p>
+<p><a href="{html.escape(alt)}">HTTPS로 시도</a> (권장)</p>{proceed}
+<p>가장 안전한 것은 <code>.mosaic</code> 서비스입니다. 출구 노드 없이 상대 서버까지 종단 간 암호화됩니다.</p>""", 200, url)
 
     def _deliver(self, r, top: str):
         s = self.server_ref
         ctype = r.header("Content-Type", "application/octet-stream")
         mime = ctype.split(";")[0].strip().lower()
-        insecure = urlsplit(r.url).scheme == "http"
+        insecure = not is_secure(r.url)
         if mime in ("text/html", "application/xhtml+xml"):
             text = r.body.decode(_charset(ctype, r.body), errors="replace")
             rw = Rewriter(s.prefix, top)
@@ -277,6 +298,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b"", "text/plain")
             return
         top = top or site_of(sp.hostname or "")
+        if not is_secure(url):
+            self._send(204, b"", "text/plain")    # 평문 HTTP 하위 리소스 차단 (출구가 읽을 수 있음)
+            return
         try:
             r = fetch(s.socks, url, "site:" + top, s.jar, top, extra={"Accept": "*/*"})
         except Exception:      # noqa: BLE001
@@ -294,7 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             sp = urlsplit(target)
             url = target.split("?")[0] + "?" + urlencode(q) if q else target
             if sp.scheme in ("http", "https"):
-                self._view(url)
+                self._view(url, ok=False)
             else:
                 self._err("잘못된 폼 대상", 400)
             return

@@ -55,6 +55,8 @@ class ExitService:
         self.closed_ids: dict[bytes, float] = {}
         self.reasm = P.Reassembler()
         self._gc = None
+        self.wrap = None            # 응답 셀 래퍼 (네이티브 서비스의 E2E 암호화)
+        self.reply_overhead = 0
 
     def policy(self) -> dict:
         return {"reject_private": not self.allow_private, "reject_ports": sorted(self.blocked_ports)}
@@ -140,14 +142,7 @@ class ExitService:
             req = json.loads(data)
             host, port = str(req["host"]), int(req["port"])
             s.reply_k = max(1, min(int(req.get("reply_k", 2)), P.MAX_N))
-            if self.upstream_proxy:
-                r, w = await self._via_proxy(host, port)
-            else:
-                infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
-                addr = infos[0][4][0]
-                if not self._allowed(host, port, addr):
-                    raise PermissionError("exit policy rejects destination")
-                r, w = await asyncio.wait_for(asyncio.open_connection(addr, port), 20)
+            r, w = await self._connect(host, port)
         except Exception as e:     # noqa: BLE001
             log.info("exit open failed: %s", e)
             await self._reply(s, K.D_ERROR, str(e)[:200].encode())
@@ -161,6 +156,15 @@ class ExitService:
         if s.close_after_connect:
             w.write_eof()
         s.reader_task = asyncio.create_task(self._pump(s, r))
+
+    async def _connect(self, host: str, port: int):
+        if self.upstream_proxy:
+            return await self._via_proxy(host, port)
+        infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        addr = infos[0][4][0]
+        if not self._allowed(host, port, addr):
+            raise PermissionError("exit policy rejects destination")
+        return await asyncio.wait_for(asyncio.open_connection(addr, port), 20)
 
     async def _via_proxy(self, host: str, port: int):
         """테스트 환경용: 상위 HTTP CONNECT 프록시를 거쳐 나간다."""
@@ -184,7 +188,7 @@ class ExitService:
                 while len(s.surb_sets) <= 1:    # 마지막 묶음 하나는 CLOSE용으로 남긴다
                     s.surb_event.clear()
                     await asyncio.wait_for(s.surb_event.wait(), SESSION_IDLE)
-                data = await r.read(K.data_max(s.reply_k))
+                data = await r.read(K.data_max(s.reply_k) - self.reply_overhead)
                 if not data:
                     break
                 s.last = time.time()
@@ -206,8 +210,14 @@ class ExitService:
         cell = K.Cell(t, s.sid, s.next_down, data)
         s.next_down += 1
         k = min(s.reply_k, len(surb_set))
+        msg = cell.pack()
+        if self.wrap is not None:
+            try:
+                msg = self.wrap(s.sid, msg)
+            except Exception:     # noqa: BLE001
+                return
         # 응답도 k-of-n 분할: 조각 i는 SURB i (서로 다른 경로)로 → 마름모 응답 경로
-        for frag, surb in zip(P.split(cell.pack(), k, len(surb_set)), surb_set):
+        for frag, surb in zip(P.split(msg, k, len(surb_set)), surb_set):
             first, pkt = S.use_surb(surb, frag.pack())
             await self.node.send_packet(first, pkt)
 
