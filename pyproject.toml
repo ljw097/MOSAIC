@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mosaic-anon"
+version = "0.1.0"
+description = "MOSAIC: Sphinx mixnet with cover traffic, post-quantum hybrid links, and a script-free anonymous browser"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=47"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+mosaic = "mosaic.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mosaic*"]

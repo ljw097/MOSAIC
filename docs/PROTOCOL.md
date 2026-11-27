@@ -1,0 +1,87 @@
+# MOSAIC 프로토콜 명세 v1 (초안)
+
+## 1. 암호 프리미티브
+
+| 용도 | 알고리즘 |
+|---|---|
+| Sphinx 키 합의·블라인딩 | X25519 (클램핑된 스칼라 곱의 교환법칙 이용) |
+| 링크 키 합의 | X25519 (정적+임시) ‖ ML-KEM-768 → HKDF-SHA256 |
+| 헤더 스트림 암호 | ChaCha20 |
+| 헤더 MAC | HMAC-SHA256 |
+| 페이로드 | LIONESS (ChaCha20 + 키 있는 BLAKE2b, 4라운드) |
+| 링크 프레임 | ChaCha20-Poly1305, 방향별 키, 64비트 카운터 nonce |
+| 서명 | Ed25519 (노드 신원, 권한 서버) |
+| 키 유도 | 키 있는 BLAKE2b (`kdf(s, label)`), HKDF-SHA256 |
+
+## 2. Sphinx 패킷
+
+```
+PACKET (2432B) = alpha(32) ‖ beta(320) ‖ gamma(32) ‖ payload(2048)
+beta  = MAX_HOPS(5) × [routing(32) ‖ mac(32)]
+routing = flag(1) ‖ delay_ms(4, BE) ‖ target(16) ‖ extra(11)
+```
+
+flag 값: `RELAY=1`, `DELIVER_EXIT=2`, `DELIVER_MAILBOX=3`, `FINAL_DROP=4`
+
+**생성 (송신자)**
+1. 무작위 x를 뽑는다. `alpha_0 = X25519(x, G)`.
+2. 홉 i의 공유비밀은 `s_i = X25519(b_{i-1}, … X25519(b_0, X25519(x, PK_i)))`이다.
+   여기서 `b_j = H("blind", alpha_j, s_j)`, `alpha_{j+1} = X25519(b_j, alpha_j)`.
+3. `rho, mu, pi, tag`는 모두 `kdf(s_i, label)`로 유도한다.
+4. 필러(filler)와 beta, gamma는 Danezis–Goldberg 방식으로, 뒤 홉부터 앞 홉 순서로 만든다.
+5. 페이로드는 `0^16 ‖ body`이다. 마지막 홉부터 앞 홉 순서로 `LIONESS_enc(pi_i)`를 적용한다.
+
+**처리 (노드)**
+1. `s = X25519(sk, alpha)`. `HMAC(mu, beta) == gamma`인지 확인한다.
+2. `tag`가 재전송 캐시에 있으면 폐기한다.
+3. `B = (beta ‖ 0^64) ⊕ ChaCha20(rho)`. 다음 헤더는 `alpha' = X25519(b, alpha)`, `beta' = B[64:]`, `gamma' = B[32:64]`.
+4. `payload' = LIONESS_dec(pi, payload)`.
+5. RELAY이면 `delay_ms`만큼 붙잡아 둔 뒤 `target`으로 보낸다.
+
+**SURB**는 `first_hop(16) ‖ header(384) ‖ k0(32)`로 이루어진다. 응답자는 `LIONESS_enc(k0, 0^16‖body)`를
+헤더 뒤에 붙여 보낸다. 각 홉은 dec를 적용한다. SURB를 만든 쪽은 홉 키로 enc를 거꾸로 적용한 다음
+`k0`로 dec 하고 무결성 접두어를 확인한다.
+
+## 3. 링크 계층
+
+```
+I → R : "MOSAIC/1" ‖ e_I(32) ‖ ML-KEM.Encaps(K_R).ct(1088)
+R → I : e_R(32) ‖ HMAC(k_c, "responder-confirm")
+k_ir ‖ k_ri ‖ k_c = HKDF(DH(e_I,S_R) ‖ ss_kem ‖ DH(e_I,e_R), "MOSAIC link v1" ‖ H(transcript))
+```
+
+이후 모든 프레임은 `AEAD(type(1) ‖ body ‖ zero-pad) = 2456B`로 길이가 고정된다.
+
+| type | 의미 |
+|---|---|
+| 1 PACKET | Sphinx 패킷 |
+| 2 DELIVER | 게이트웨이 → 클라이언트: `surb_id(8) ‖ payload(2048)` |
+| 3 REGISTER | 클라이언트 → 게이트웨이: `mailbox_id(16)` |
+| 4 DUMMY | 커버 |
+
+## 4. 종단 셀 (클라이언트 ↔ 출구)
+
+Sphinx 페이로드 본문(2032B) = `type(1) ‖ session(16) ‖ seq(4) ‖ len(2) ‖ data(≤2009)`
+
+- 상향: `OPEN{json host,port}`, `DATA`, `CLOSE`, `SURBS{n(1) ‖ n×SURB(432)}` (셀당 최대 4개), `DROP`
+- 하향: `CONNECTED`, `DATA`, `CLOSE`, `ERROR`
+- 방향마다 seq를 따로 매긴다. Poisson 지연 때문에 순서가 뒤바뀌므로 받는 쪽이 재정렬한다.
+- 흐름 제어: 출구는 SURB가 있을 때만 TCP에서 읽는다. 그래서 클라이언트가 미리 건넨 SURB 수(window)가
+  곧 하향 혼잡 창이다.
+
+## 5. 트래픽 스케줄링
+
+- 클라이언트: `Exp(λ_P)` 간격마다 큐에 실제 메시지가 있으면 보내고, 없으면 DROP 커버를 보낸다.
+  이와 별도로 `Exp(λ_L)` 간격으로 루프를, `Exp(λ_D)` 간격으로 드롭을 보낸다.
+- 게이트웨이: 클라이언트마다 `Exp(λ_down)` 간격으로 우편함의 메시지를 보내고, 비어 있으면 DUMMY를 보낸다.
+- 믹스/게이트웨이 노드: `Exp(λ_M)` 간격으로 L1→L2→L3→자신 경로의 루프를 보낸다.
+- 홉 지연은 송신자가 `Exp(1/μ)`에서 뽑는다. 노드는 최대 30초로 자른다.
+
+## 6. 디렉터리
+
+- 기술자: `{node_id = H(identity_pk)[:16], role, host, port, identity/sphinx/link/mlkem 공개키,
+  published, exit_policy}`를 Ed25519로 서명한다.
+- 권한 서버는 TTL 안의 기술자 목록과 epoch에 서명해 배포한다.
+- 클라이언트는 고정(pinned)된 권한 서버 키로 서명을 검증한다. 기술자 다이제스트가 threshold 개
+  이상의 문서에 들어 있어야 채택한다.
+- 믹스 계층은 `H("layer", epoch, node_id)` 순서로 정렬한 뒤 라운드로빈으로 배정한다.
