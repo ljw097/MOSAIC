@@ -18,7 +18,7 @@ import logging
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit  # noqa: F401
 
 from .fetcher import CookieJar, FetchError, fetch
 from .sanitizer import Rewriter, rewrite_css, sanitize_html
@@ -26,7 +26,20 @@ from .sanitizer import Rewriter, rewrite_css, sanitize_html
 log = logging.getLogger("mosaic.browser")
 
 CSP = ("default-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'none'; object-src 'none'; frame-src 'none'; "
-       "worker-src 'none'; connect-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+       "worker-src 'none'; connect-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'")
+# 셸(우리 코드)만 스크립트를 실행한다. 외부 출처는 하나도 허용하지 않는다.
+SHELL_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self'; "
+             "connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+STATIC_DIR = __import__("pathlib").Path(__file__).with_name("static")
+STATIC_TYPES = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".html": "text/html; charset=utf-8"}
+GEM = ('<svg viewBox="0 0 16 16"><path d="M8 1.5l6.5 6.5L8 14.5 1.5 8z" fill="none" stroke="currentColor" '
+       'stroke-width="1.4"/><path d="M8 5.2L10.8 8 8 10.8 5.2 8z" fill="currentColor"/></svg>')
+ICO_WARN = ('<svg viewBox="0 0 16 16"><path d="M8 2l6.5 11.5h-13z" fill="none" stroke="currentColor" stroke-width="1.5" '
+            'stroke-linejoin="round"/><path d="M8 6.5v3.2M8 11.6v.1" stroke="currentColor" stroke-width="1.6" '
+            'stroke-linecap="round"/></svg>')
+ICO_ERR = ('<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.5"/>'
+           '<path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>')
 SECURITY_HEADERS = {
     "Content-Security-Policy": CSP,
     "Referrer-Policy": "no-referrer",
@@ -163,28 +176,46 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        for k, v in SECURITY_HEADERS.items():
-            self.send_header(k, v)
-        for k, v in (extra or {}).items():
+        # extra가 같은 헤더(예: CSP)를 주면 기본값을 대체한다. 두 번 보내면 브라우저가 둘 다 적용한다.
+        for k, v in {**SECURITY_HEADERS, **(extra or {})}.items():
             self.send_header(k, v)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    @property
+    def framed(self) -> bool:
+        """셸의 iframe 안에서 요청됐는가. 그렇다면 페이지에 도구 막대를 넣지 않는다 (셸이 가진다)."""
+        return self.headers.get("Sec-Fetch-Dest") == "iframe"
+
+    def bar(self, url: str, insecure: bool = False) -> str:
+        if self.framed:
+            return ""
+        return self.server_ref.toolbar(url, insecure)
+
     def _page(self, title: str, inner: str, status: int = 200, url: str = ""):
         s = self.server_ref
         doc = (f'<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" '
-               f'content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title><style>'
-               'body{margin:0;font:15px/1.6 system-ui,sans-serif;background:#f6f8fa;color:#1d2329}'
-               'main{max-width:760px;margin:32px auto;padding:0 16px}code{background:#e8ecef;padding:1px 4px;'
-               'border-radius:4px}table{border-collapse:collapse}td{padding:4px 12px;border-bottom:1px solid #dde}'
-               '@media (prefers-color-scheme:dark){body{background:#0d1114;color:#dfe6ec}code{background:#20282f}'
-               'td{border-color:#2a333b}}</style></head><body>'
-               f'{s.toolbar(url)}<main>{inner}</main></body></html>')
+               f'content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>'
+               f'<link rel="stylesheet" href="{s.prefix}/static/page.css"></head><body>'
+               f'{self.bar(url)}{inner}</body></html>')
         self._send(status, doc.encode(), "text/html; charset=utf-8")
 
+    def _notice(self, title: str, heading: str, url: str, body_html: str, actions: list[tuple[str, str, str]],
+                warn: bool = False, detail: str = "", status: int = 200):
+        acts = "".join(f'<a class="btn {c}" href="{html.escape(h)}">{html.escape(t)}</a>' for c, h, t in actions)
+        det = f'<div class="detail">{html.escape(detail)}</div>' if detail else ""
+        self._page(title, f'<div class="notice {"warn" if warn else ""}"><div class="ico">{ICO_WARN if warn else ICO_ERR}'
+                          f'</div><h1>{html.escape(heading)}</h1><div class="url">{html.escape(url)}</div>{body_html}'
+                          f'<div class="actions">{acts}</div>{det}</div>', status, url)
+
     def _err(self, msg: str, status: int = 502, url: str = ""):
-        self._page("오류", f"<h2>요청 실패</h2><p>{html.escape(msg)}</p>", status, url)
+        s = self.server_ref
+        acts = [("primary", f"{s.prefix}/view?u={quote(url, safe='')}", "다시 시도")] if url else []
+        acts.append(("quiet", f"{s.prefix}/start", "새 탭으로"))
+        self._notice("연결할 수 없음", "이 페이지에 연결할 수 없습니다", url,
+                     "<p>믹스넷 경로나 출구, 목적지 서버에서 요청이 실패했습니다. 잠시 후 다시 시도하거나 "
+                     "<b>새 신원</b>으로 다른 출구를 써 보세요.</p>", acts, detail=msg, status=status)
 
     # ------------------------------------------------------------ 라우팅
     def do_HEAD(self):
@@ -207,8 +238,24 @@ class Handler(BaseHTTPRequestHandler):
         route = sp.path[len(s.prefix):] or "/"
         q = {k: v[0] for k, v in parse_qs(sp.query, keep_blank_values=True).items()}
         try:
-            if route == "/":
-                self._home()
+            if sp.path == s.prefix:
+                self.send_response(301)
+                self.send_header("Location", s.prefix + "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif route == "/":
+                self._static("shell.html", SHELL_CSP)
+            elif route.startswith("/static/"):
+                self._static(route[len("/static/"):], SHELL_CSP)
+            elif route == "/start":
+                self._start()
+            elif route == "/go":
+                self._go(q.get("q", ""))
+            elif route == "/api/status":
+                self._api_status()
+            elif route == "/api/newid" and method == "POST":
+                s.new_identity()
+                self._send(204, b"", "text/plain")
             elif route == "/view" and "u" in q:
                 self._view(q["u"], method="GET", ok=q.get("ok") == "1")
             elif route == "/res" and "u" in q:
@@ -225,20 +272,75 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _home(self):
-        self._page("MOSAIC", """
-<h1>MOSAIC 익명 브라우저</h1>
-<p>모든 요청은 5개 홉 믹스넷(게이트웨이 → 믹스 3계층 → 출구)을 지나갑니다. 홉마다 패킷이 무작위로 지연되고
-섞이며, 실제 트래픽은 커버 트래픽 속에 섞여 보이지 않습니다.</p>
-<ul>
-<li>JavaScript를 실행하지 않습니다. 지문채취와 WebRTC IP 누출이 원천적으로 막힙니다.</li>
-<li>사이트마다 출구와 쿠키 저장소가 따로라서, 사이트들이 서로 정보를 모아 당신을 추적할 수 없습니다.</li>
-<li>HTTPS 전용입니다. 출구 노드도 내용을 볼 수 없습니다. 평문 HTTP는 매번 확인을 받습니다.</li>
-<li>사이트가 MOSAIC 다중 입구를 지원하면(<code>Mosaic-Endpoint</code> 헤더) 자동으로 전환합니다. 조각이 서로 다른
-출구를 거쳐 서버의 여러 입구로 들어가고, 서버가 직접 합칩니다. 출구 하나가 메시지를 통째로 보지 못합니다.</li>
-<li><code>.mosaic</code> 주소는 출구 노드 없이 상대 서버까지 종단 간 암호화(X25519+ML-KEM)로 갑니다.</li>
-</ul>
-<p>위 주소창에 주소를 입력하세요. 예: <code>example.com</code></p>""")
+    def _static(self, name: str, csp: str):
+        f = STATIC_DIR / name
+        if "/" in name or ".." in name or f.suffix not in STATIC_TYPES or not f.is_file():
+            self._send(404, b"not found", "text/plain")
+            return
+        hdrs = {"Content-Security-Policy": csp}
+        if name == "page.css":
+            hdrs = {}
+        self._send(200, f.read_bytes(), STATIC_TYPES[f.suffix], hdrs)
+
+    def _send_json(self, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self._send(200, body, "application/json; charset=utf-8")
+
+    def _api_status(self):
+        c = self.server_ref.client
+        if c is None:
+            self._send_json({"stats": {}, "endpoints": [], "services": []})
+            return
+        self._send_json({
+            "stats": c.stats, "profile": c.profile.name,
+            "gateways": [l.gateway.node_id.hex()[:10] for l in c.lanes],
+            "split_forward": f"k∈{{{c.profile.split_k[0]}..{c.profile.split_k[1]}}}, n=k+{{{c.profile.split_extra[0]}..{c.profile.split_extra[1]}}}",
+            "split_reply": f"{c.profile.reply_k}-of-{c.profile.reply_n}",
+            "nodes": len(c.consensus.nodes) if c.consensus else 0,
+            "open_streams": len(c.streams),
+            "endpoints": sorted(c.endpoints),
+            "services": sorted(c.consensus.services) if c.consensus else [],
+        })
+
+    def _go(self, query: str):
+        """새 탭 검색창: 주소처럼 보이면 열고, 아니면 JS 없이 동작하는 DuckDuckGo HTML 검색."""
+        qs = query.strip()
+        host = qs.split("/")[0].split(":")[0].lower()
+        if not qs:
+            self._start()
+        elif "://" in qs or (" " not in qs and "." in host):
+            self._view(qs)
+        else:
+            self._view("https://html.duckduckgo.com/html/?" + urlencode({"q": qs}))
+
+    def _start(self):
+        s = self.server_ref
+        c = s.client
+        tiles = ""
+        if c is not None:
+            for d in sorted(c.endpoints):
+                tiles += (f'<a class="tile" href="{s.prefix}/view?u={quote("http://" + d + "/", safe="")}">'
+                          f'<b>◇ {html.escape(d)}</b><span>다중 입구 · 서버가 직접 합침</span></a>')
+            for a in (sorted(c.consensus.services)[:6] if c.consensus else []):
+                tiles += (f'<a class="tile" href="{s.prefix}/view?u={quote("http://" + a + "/", safe="")}">'
+                          f'<b>◇ .mosaic 서비스</b><span>{html.escape(a)}</span></a>')
+        prof = c.profile.name if c else "-"
+        quick = f'<h2 class="sec">MOSAIC 네이티브</h2><div class="tiles">{tiles}</div>' if tiles else ""
+        self._page("새 탭", f"""<div class="wrap">
+<div class="hero">{GEM}<h1>MOSAIC</h1><p>믹스넷 위의 익명 브라우저</p></div>
+<form class="search" action="{s.prefix}/go" method="get"><input name="q" placeholder="검색하거나 주소 입력"
+ autocomplete="off" aria-label="검색"><button type="submit">이동</button></form>
+<div class="status"><span class="tag">커버 트래픽 동작 중</span><span class="tag">조각 분할 (마름모 경로)</span>
+<span class="tag">링크 X25519 + ML-KEM-768</span><span class="tag">스크립트 차단</span><span class="tag">프로파일: {html.escape(prof)}</span></div>
+{quick}
+<h2 class="sec">연결 방식</h2>
+<div class="modes">
+<div class="mode"><h3>◇ 다중 입구 <span class="k">가장 강함</span></h3><p>서버가 서로 다른 출구에서 조각을 받아 직접 합칩니다.
+출구는 메시지당 조각 하나, 그것도 종단 간 암호문만 봅니다.</p></div>
+<div class="mode"><h3>◇ .mosaic <span class="k">출구 없음</span></h3><p>상대 서비스까지 종단 간 암호화. 서로의 IP를 모릅니다.</p></div>
+<div class="mode"><h3>🔒 HTTPS <span class="k mid">출구 경유</span></h3><p>MOSAIC을 모르는 사이트. 출구 1곳이 연결하지만 TLS 때문에
+내용을 못 보고, 믹싱 때문에 당신을 추적할 수 없습니다.</p></div>
+</div></div>""")
 
     def _status(self):
         c = self.server_ref.client
@@ -288,17 +390,15 @@ class Handler(BaseHTTPRequestHandler):
     def _https_only(self, url: str, method: str):
         s = self.server_ref
         https = "https://" + url.split("://", 1)[1]
-        go = f"{s.prefix}/view?u={quote(url, safe='')}&ok=1"
-        alt = f"{s.prefix}/view?u={quote(https, safe='')}"
-        proceed = (f'<p><a href="{html.escape(go)}">위험을 이해하고 HTTP로 계속</a></p>' if method == "GET" else "")
-        self._page("HTTPS 전용 모드", f"""
-<h2>HTTPS 전용 모드가 평문 HTTP를 막았습니다</h2>
-<p><code>{html.escape(url)}</code></p>
-<p>일반 인터넷 사이트는 마지막 구간을 출구 노드가 대신 연결합니다. HTTP는 암호화되지 않으므로 출구 노드를
-장악한 사람이 이 페이지의 내용, 입력하는 값, 쿠키를 모두 읽고 바꿀 수 있습니다. 누가 보냈는지는
-출구도 모르지만, 내용에 이름이나 계정이 들어 있으면 그것만으로 신원이 드러납니다.</p>
-<p><a href="{html.escape(alt)}">HTTPS로 시도</a> (권장)</p>{proceed}
-<p>가장 안전한 것은 <code>.mosaic</code> 서비스입니다. 출구 노드 없이 상대 서버까지 종단 간 암호화됩니다.</p>""", 200, url)
+        acts = [("primary", f"{s.prefix}/view?u={quote(https, safe='')}", "HTTPS로 열기 (권장)")]
+        if method == "GET":
+            acts.append(("", f"{s.prefix}/view?u={quote(url, safe='')}&ok=1", "위험을 감수하고 HTTP로 계속"))
+        self._notice("HTTPS 전용 모드", "암호화되지 않은 연결을 막았습니다", url,
+                     "<p>이 사이트는 MOSAIC을 지원하지 않아 마지막 구간을 <b>출구 노드</b>가 대신 연결합니다. "
+                     "HTTP는 암호화되지 않아서, 출구를 장악한 사람이 페이지 내용, 입력값, 쿠키를 읽고 바꿀 수 있습니다. "
+                     "누가 보냈는지는 출구도 모르지만, 내용에 이름이나 계정이 들어 있으면 그것만으로 신원이 드러납니다.</p>"
+                     "<p>출구가 내용을 전혀 볼 수 없는 연결: <b>HTTPS</b>, <b>.mosaic</b>, <b>◇ 다중 입구</b> 사이트.</p>",
+                     acts, warn=True)
 
     def _deliver(self, r, top: str):
         s = self.server_ref
@@ -310,7 +410,7 @@ class Handler(BaseHTTPRequestHandler):
         if mime in ("text/html", "application/xhtml+xml"):
             text = r.body.decode(_charset(ctype, r.body), errors="replace")
             rw = Rewriter(s.prefix, top)
-            out = sanitize_html(text, r.url, rw, s.toolbar(r.url, insecure))
+            out = sanitize_html(text, r.url, rw, self.bar(r.url, insecure))
             out = '<meta charset="utf-8">' + out if "<head" not in out[:2000].lower() else out.replace(
                 "<head>", '<head><meta charset="utf-8">', 1)
             self._send(r.status, out.encode("utf-8"), "text/html; charset=utf-8")

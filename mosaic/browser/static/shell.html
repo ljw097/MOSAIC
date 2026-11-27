@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MOSAIC</title>
+<link rel="stylesheet" href="static/shell.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1l7 7-7 7-7-7z' fill='%231f9e78'/%3E%3C/svg%3E">
+</head>
+<body>
+<div class="app">
+  <div class="tabstrip" id="tabstrip">
+    <div class="brand">
+      <svg class="gem" viewBox="0 0 16 16"><path d="M8 1l7 7-7 7-7-7z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M8 5l3 3-3 3-3-3z" fill="currentColor"/></svg>
+      <span>MOSAIC</span>
+    </div>
+    <div id="tabs" style="display:contents"></div>
+    <button class="newtab" id="newtab" title="새 탭 (Ctrl+T)" aria-label="새 탭">
+      <svg viewBox="0 0 16 16" width="16" height="16"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+
+  <div class="toolbar">
+    <button class="iconbtn" id="back" title="뒤로 (Alt+←)" aria-label="뒤로">
+      <svg viewBox="0 0 20 20"><path d="M12.5 4.5L7 10l5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="iconbtn" id="fwd" title="앞으로 (Alt+→)" aria-label="앞으로">
+      <svg viewBox="0 0 20 20"><path d="M7.5 4.5L13 10l-5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+    <button class="iconbtn" id="reload" title="새로고침 (Ctrl+R)" aria-label="새로고침">
+      <svg viewBox="0 0 20 20"><path d="M15.5 10a5.5 5.5 0 1 1-1.6-3.9M15.5 4v3.5H12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+
+    <form class="omnibox" id="omnibox" autocomplete="off">
+      <button type="button" class="chip start" id="chip" aria-haspopup="dialog"></button>
+      <input id="addr" type="text" spellcheck="false" placeholder="검색하거나 주소 입력 (예: example.com, ….mosaic)" aria-label="주소">
+    </form>
+
+    <button class="pill" id="newid" title="쿠키 삭제 + 모든 사이트에 새 출구">
+      <svg viewBox="0 0 20 20"><path d="M4 10a6 6 0 0 1 10.3-4.2M16 10a6 6 0 0 1-10.3 4.2M14.5 3v3h-3M5.5 17v-3h3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span class="txt">새 신원</span>
+    </button>
+    <button class="iconbtn" id="paneltoggle" title="네트워크 패널" aria-label="네트워크 패널" aria-pressed="false">
+      <svg viewBox="0 0 20 20"><path d="M3 15l4-5 3 3 4-6 3 4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </button>
+  </div>
+
+  <div class="progress" id="progress"></div>
+
+  <div class="main">
+    <div class="frames" id="frames"></div>
+    <aside class="drawer" id="drawer" aria-label="네트워크 상태">
+      <div class="drawer-inner">
+        <h2><span class="pulse" id="pulse"></span>믹스넷 연결</h2>
+        <div class="card">
+          <h3>초당 송신 패킷</h3>
+          <canvas class="chart" id="chart" width="600" height="180"></canvas>
+          <div class="legend"><span><i style="background:var(--accent)"></i>실제</span><span><i style="background:var(--cover)"></i>커버 (드롭·루프)</span></div>
+          <p class="note">실제 트래픽이 없을 때도 같은 속도로 커버 패킷이 흐릅니다. 밖에서 보면 언제 무엇을 하는지 구별되지 않습니다.</p>
+        </div>
+        <div class="kpis">
+          <div class="kpi"><div class="v" id="k-cover">–</div><div class="l">커버 비율</div></div>
+          <div class="kpi"><div class="v" id="k-rtt">–</div><div class="l">루프 왕복 (ms)</div></div>
+          <div class="kpi"><div class="v" id="k-frag">–</div><div class="l">메시지당 조각</div></div>
+          <div class="kpi"><div class="v" id="k-loop">–</div><div class="l">루프 귀환율</div></div>
+        </div>
+        <div class="card">
+          <h3>이 클라이언트</h3>
+          <dl class="rows" id="rows"></dl>
+        </div>
+        <p class="note">루프 패킷이 돌아오지 않으면 누군가 패킷을 지연·차단하는 능동 공격의 신호일 수 있습니다.</p>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="popover" id="popover" role="dialog" aria-label="연결 경로"></div>
+<div class="toast" id="toast"></div>
+<script src="static/shell.js"></script>
+</body>
+</html>

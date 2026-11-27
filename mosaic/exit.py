@@ -207,7 +207,7 @@ class ExitService:
         s.reader_task = asyncio.create_task(self._pump(s, r))
 
     async def _connect(self, host: str, port: int):
-        if self.upstream_proxy:
+        if self.upstream_proxy and not (self.allow_private and host in ("127.0.0.1", "::1", "localhost")):
             return await self._via_proxy(host, port)
         infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
         addr = infos[0][4][0]
