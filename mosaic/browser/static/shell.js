@@ -109,6 +109,7 @@
   function go(t, url) {
     t.url = url || "";
     t.loading = true;
+    t.ready = false;
     t.frame.src = url ? viewURL(url) : P + "/start";
     renderTab(t);
     if (t === active) syncChrome();
@@ -125,7 +126,7 @@
     // iframe 안의 링크 클릭으로 시작되는 탐색도 진행 막대에 반영
     try {
       t.frame.contentWindow.addEventListener("beforeunload", () => {
-        t.loading = true; renderTab(t); if (t === active) syncChrome();
+        t.loading = true; t.ready = false; renderTab(t); if (t === active) syncChrome();
       });
     } catch { /* */ }
     renderTab(t);
@@ -136,7 +137,7 @@
     if (!t.el) return;
     const k = kindOf(t.url);
     const ico = t.el.firstElementChild;
-    if (t.loading) {
+    if (t.loading && !t.ready) {
       ico.className = "spin";
       ico.textContent = "";
     } else {
@@ -170,6 +171,7 @@
         const d = t.frame.contentDocument;
         if (!d || d.readyState === "loading" || t.frame.contentWindow.location.href === "about:blank") continue;
         const u = realURL(t.frame), title = d.title;
+        if (!t.ready) { t.ready = true; renderTab(t); }   // 문서 준비 완료: 탭 스피너는 멈추고 진행 막대만 이미지를 기다린다
         if ((title && title !== t.title) || u !== t.url) {
           t.url = u;
           t.title = title || (u ? hostOf(u) : "새 탭");
@@ -305,7 +307,19 @@
       `<div class="head"><div class="badge ${k === "http" ? "http" : ""}">${KIND[k].icon}</div>` +
       `<div><b>${esc(head[0])}</b><span>${esc(h)} · ${esc(head[1])}</span></div></div>` +
       `<div class="route">${routeSVG(k === "start" ? "endpoint" : k, h)}</div>` +
-      `<div class="facts">${facts.map(([c, b, t]) => `<div class="fact ${c}"><b>${esc(b)}</b>${esc(t)}</div>`).join("")}</div>`;
+      `<div class="facts">${facts.map(([c, b, t]) => `<div class="fact ${c}"><b>${esc(b)}</b>${esc(t)}</div>`).join("")}</div>` +
+      (k === "https" || k === "http" || k === "endpoint"
+        ? `<div class="pop-actions"><p class="note">${k === "endpoint" ? "조각마다 출구를 새로 고릅니다." : "이 사이트에만 다른 출구를 씁니다. 쿠키와 다른 사이트는 그대로입니다."}</p>` +
+          (k === "endpoint" ? "" : `<button class="pill" id="newroute">이 사이트 새 경로</button>`) + `</div>`
+        : "");
+    const nr = $("newroute");
+    if (nr) nr.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await fetch(P + "/api/newroute?host=" + encodeURIComponent(h), { method: "POST" });
+      closePop();
+      toast(h + ": 새 출구로 다시 연결합니다");
+      go(active, active.url);
+    });
   }
 
   // ------------------------------------------------------------------ 네트워크 패널
@@ -354,6 +368,30 @@
     $("rows").innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("");
   }
 
+  const LEVEL = {
+    interactive: ["빠름", "웹 탐색용. 홉당 평균 지연이 짧습니다."],
+    balanced: ["균형", "지연과 커버 트래픽을 늘려 상관 공격에 더 강합니다."],
+    paranoid: ["최고", "긴 지연, 3-of-5 이상 분할, 게이트웨이 3곳(재시작 시). 메시징·민감한 작업용."],
+  };
+  function renderSeg(s) {
+    const seg = $("seg");
+    const names = s.profiles || [];
+    if (seg.childElementCount !== names.length) {
+      seg.innerHTML = names.map((n) => `<button role="radio" data-p="${esc(n)}">${esc((LEVEL[n] || [n])[0])}</button>`).join("");
+      seg.querySelectorAll("button").forEach((b) => b.addEventListener("click", async () => {
+        const name = b.dataset.p;
+        await fetch(P + "/api/profile?name=" + encodeURIComponent(name), { method: "POST" });
+        status.profile = name;
+        renderSeg(status);
+        toast("보안 수준: " + (LEVEL[name] || [name])[0]);
+      }));
+    }
+    seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-checked", String(b.dataset.p === s.profile)));
+    const info = (s.profile_info || {})[s.profile];
+    $("segnote").textContent = ((LEVEL[s.profile] || ["", ""])[1]) +
+      (info ? ` 홉당 평균 ${info.delay_ms}ms · 링크당 ${info.rate}패킷/초 · 분할 k=${info.split}` : "");
+  }
+
   async function poll() {
     try {
       const r = await fetch(P + "/api/status", { cache: "no-store" });
@@ -370,6 +408,7 @@
       $("k-loop").textContent = st.sent_loop ? Math.min(100, Math.round((st.loops_back / st.sent_loop) * 100)) + "%" : "–";
       $("pulse").classList.remove("off");
       setRows(status);
+      renderSeg(status);
       drawChart();
       if (active) { renderTab(active); syncChrome(); }
     } catch {

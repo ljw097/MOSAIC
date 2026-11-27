@@ -20,6 +20,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit  # noqa: F401
 
+from ..client import PROFILES
 from .fetcher import CookieJar, FetchError, fetch
 from .sanitizer import Rewriter, rewrite_css, sanitize_html
 
@@ -139,8 +140,20 @@ class BrowserServer:
         except Exception as e:      # noqa: BLE001
             log.info("endpoint discovery for %s failed: %s", sp.hostname, e)
 
+    def new_route(self, host: str):
+        """이 사이트만 새 출구·새 연결. 쿠키와 다른 사이트는 그대로."""
+        from .fetcher import POOL
+        if not host:
+            return
+        iso = "site:" + site_of(host)
+        POOL.drop(iso)
+        if self.client and self.loop:
+            self.loop.call_soon_threadsafe(self.client.new_route, "user:" + iso)
+
     def new_identity(self):
+        from .fetcher import POOL
         self.jar.clear()
+        POOL.clear()            # 기존 스트림(=기존 출구)을 재사용하지 않는다
         if self.client and self.loop:
             self.loop.call_soon_threadsafe(self.client.new_identity)
 
@@ -256,6 +269,16 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/newid" and method == "POST":
                 s.new_identity()
                 self._send(204, b"", "text/plain")
+            elif route == "/api/newroute" and method == "POST":
+                s.new_route(q.get("host", ""))
+                self._send(204, b"", "text/plain")
+            elif route == "/api/profile" and method == "POST":
+                name = q.get("name", "")
+                if s.client is None or name not in PROFILES:
+                    self._send(400, b"bad profile", "text/plain")
+                else:
+                    s.loop.call_soon_threadsafe(s.client.set_profile, name)
+                    self._send(204, b"", "text/plain")
             elif route == "/view" and "u" in q:
                 self._view(q["u"], method="GET", ok=q.get("ok") == "1")
             elif route == "/res" and "u" in q:
@@ -292,7 +315,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"stats": {}, "endpoints": [], "services": []})
             return
         self._send_json({
-            "stats": c.stats, "profile": c.profile.name,
+            "stats": c.stats, "profile": c.profile.name, "profiles": list(PROFILES),
+            "profile_info": {n: {"delay_ms": p.mean_delay_ms, "rate": p.rate_payload,
+                                 "split": f"{p.split_k[0]}..{p.split_k[1]}+{p.split_extra[0]}..{p.split_extra[1]}"}
+                             for n, p in PROFILES.items()},
             "gateways": [l.gateway.node_id.hex()[:10] for l in c.lanes],
             "split_forward": f"k∈{{{c.profile.split_k[0]}..{c.profile.split_k[1]}}}, n=k+{{{c.profile.split_extra[0]}..{c.profile.split_extra[1]}}}",
             "split_reply": f"{c.profile.reply_k}-of-{c.profile.reply_n}",

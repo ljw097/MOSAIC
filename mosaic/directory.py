@@ -21,7 +21,11 @@ from . import crypto as C
 
 log = logging.getLogger("mosaic.directory")
 DESCRIPTOR_TTL = 3600
-EPOCH_LEN = 3600
+EPOCH_LEN = 3600            # Sphinx 키 로테이션 주기 (초). 테스트에서 줄일 수 있다.
+
+
+def current_epoch(now: float | None = None) -> int:
+    return int((time.time() if now is None else now) // EPOCH_LEN)
 NUM_LAYERS = 3
 ROLES = ("gateway", "mix", "exit")
 
@@ -89,14 +93,22 @@ class Descriptor:
     exit_policy: dict = field(default_factory=dict)
     sig: bytes = b""
     layer: int = -1           # 합의에서 계산 (서명 대상 아님)
+    sphinx_epochs: dict = field(default_factory=dict)    # epoch → 그 epoch의 Sphinx 공개키 (로테이션)
 
     def body(self) -> dict:
-        return {
+        b = {
             "node_id": self.node_id.hex(), "role": self.role, "host": self.host, "port": self.port,
             "identity_pk": self.identity_pk.hex(), "sphinx_pk": self.sphinx_pk.hex(),
             "link_pk": self.link_pk.hex(), "mlkem_pk": self.mlkem_pk.hex(),
             "published": self.published, "exit_policy": self.exit_policy,
         }
+        if self.sphinx_epochs:
+            b["sphinx_epochs"] = {str(e): pk.hex() for e, pk in sorted(self.sphinx_epochs.items())}
+        return b
+
+    def sphinx_key(self, epoch: int | None = None) -> bytes:
+        """패킷을 만들 시점의 epoch 키. 로테이션을 하지 않는 노드면 고정 키."""
+        return self.sphinx_epochs.get(current_epoch() if epoch is None else epoch, self.sphinx_pk)
 
     def to_json(self) -> dict:
         d = self.body()
@@ -108,12 +120,15 @@ class Descriptor:
         return cls(bytes.fromhex(d["node_id"]), d["role"], d["host"], int(d["port"]),
                    bytes.fromhex(d["identity_pk"]), bytes.fromhex(d["sphinx_pk"]),
                    bytes.fromhex(d["link_pk"]), bytes.fromhex(d["mlkem_pk"]), int(d["published"]),
-                   d.get("exit_policy", {}), bytes.fromhex(d.get("sig", "")))
+                   d.get("exit_policy", {}), bytes.fromhex(d.get("sig", "")), -1,
+                   {int(e): bytes.fromhex(pk) for e, pk in d.get("sphinx_epochs", {}).items()})
 
     @classmethod
-    def create(cls, keys: NodeKeys, role: str, host: str, port: int, exit_policy: dict | None = None) -> "Descriptor":
-        d = cls(keys.node_id, role, host, port, keys.identity_pk, keys.sphinx_pk, keys.link_pk, keys.mlkem_pk,
-                int(time.time()), exit_policy or {})
+    def create(cls, keys: NodeKeys, role: str, host: str, port: int, exit_policy: dict | None = None,
+               sphinx_epochs: dict | None = None) -> "Descriptor":
+        cur = (sphinx_epochs or {}).get(current_epoch(), keys.sphinx_pk)
+        d = cls(keys.node_id, role, host, port, keys.identity_pk, cur, keys.link_pk, keys.mlkem_pk,
+                int(time.time()), exit_policy or {}, sphinx_epochs=dict(sphinx_epochs or {}))
         d.sig = C.ed_sign(keys.identity_sk, b"MOSAIC-desc" + canonical(d.body()))
         return d
 
@@ -123,6 +138,8 @@ class Descriptor:
         if self.node_id != C.h(b"node-id", self.identity_pk, n=16):
             return False
         if len(self.sphinx_pk) != 32 or len(self.link_pk) != 32 or len(self.mlkem_pk) != C.MLKEM_PK_LEN:
+            return False
+        if len(self.sphinx_epochs) > 4 or any(len(pk) != 32 for pk in self.sphinx_epochs.values()):
             return False
         return C.ed_verify(self.identity_pk, self.sig, b"MOSAIC-desc" + canonical(self.body()))
 

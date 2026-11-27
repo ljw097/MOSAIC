@@ -29,7 +29,7 @@ MAX_UP_BUFFER = 512
 class Session:
     def __init__(self, sid: bytes):
         self.sid = sid
-        self.surb_sets: list[list[S.SURB]] = []
+        self.surb_sets: list[tuple[int, list[S.SURB]]] = []      # (epoch, 묶음)
         self.surb_event = asyncio.Event()
         self.reply_k = 2
         self.next_up = 0
@@ -157,7 +157,8 @@ class ExitService:
     def _handle(self, s: Session, c: K.Cell):
         if c.type == K.C_SURBS:
             try:
-                s.surb_sets.extend(K.unpack_surb_sets(c.data))
+                sets, epoch = K.unpack_surb_sets(c.data)
+                s.surb_sets.extend((epoch, st) for st in sets)
             except Exception:     # noqa: BLE001
                 return
             s.surb_event.set()
@@ -234,7 +235,7 @@ class ExitService:
     async def _pump(self, s: Session, r: asyncio.StreamReader):
         try:
             while True:
-                while len(s.surb_sets) <= 1:    # 마지막 묶음 하나는 CLOSE용으로 남긴다
+                while self._fresh_sets(s) <= 1:    # 마지막 묶음 하나는 CLOSE용으로 남긴다
                     s.surb_event.clear()
                     await asyncio.wait_for(s.surb_event.wait(), SESSION_IDLE)
                 data = await r.read(K.data_max(s.reply_k) - self.reply_overhead)
@@ -249,13 +250,13 @@ class ExitService:
 
     async def _reply(self, s: Session, t: int, data: bytes):
         deadline = time.time() + 30
-        while not s.surb_sets:
+        while not self._fresh_sets(s):
             s.surb_event.clear()
             try:
                 await asyncio.wait_for(s.surb_event.wait(), max(0.01, deadline - time.time()))
             except asyncio.TimeoutError:
                 return
-        surb_set = s.surb_sets.pop(0)
+        surb_set = s.surb_sets.pop(0)[1]
         cell = K.Cell(t, s.sid, s.next_down, data)
         s.next_down += 1
         k = min(s.reply_k, len(surb_set))
@@ -269,6 +270,17 @@ class ExitService:
         for frag, surb in zip(P.split(msg, k, len(surb_set)), surb_set):
             first, pkt = S.use_surb(surb, frag.pack())
             await self.node.send_packet(first, pkt)
+
+    @staticmethod
+    def _fresh_sets(s: Session) -> int:
+        """지난 epoch의 SURB 묶음은 새로 쓰지 않고 버린다. 노드는 지난 epoch 키를 '이미 전송 중인 패킷'을 위한
+        유예로만 남겨 두므로, 지금 보내면 도중에 다음 epoch로 넘어가 사라질 수 있다.
+        클라이언트도 같은 규칙과 같은 순서로 만료를 계산해 새 묶음을 보낸다."""
+        from .directory import current_epoch
+        cur = current_epoch()
+        while s.surb_sets and s.surb_sets[0][0] < cur:
+            s.surb_sets.pop(0)
+        return len(s.surb_sets)
 
     def _teardown(self, s: Session):
         if s.closed:

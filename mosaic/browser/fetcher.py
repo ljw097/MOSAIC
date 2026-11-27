@@ -7,6 +7,7 @@ import socket
 import ssl
 import struct
 import threading
+import time
 import zlib
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
@@ -17,7 +18,7 @@ UNIFORM_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
     "Accept-Encoding": "gzip, deflate",
-    "Connection": "close",
+    "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
 }
 MAX_BODY = 25 * 1024 * 1024
@@ -112,6 +113,57 @@ class CookieJar:
             self.jars.clear()
 
 
+class ConnPool:
+    """사이트(격리 키)별 keep-alive 연결 풀. 연결 하나 = 믹스넷 스트림 하나이므로, 재사용하면 스트림마다
+    드는 SURB 공급(상향 패킷)과 연결 지연이 사라진다. 격리 키가 키에 들어가 사이트끼리 연결을 공유하지 않는다."""
+
+    def __init__(self, max_idle: int = 6, ttl: float = 25):
+        self.max_idle, self.ttl = max_idle, ttl
+        self.idle: dict[tuple, list[tuple["_Conn", float]]] = {}
+        self.lock = threading.Lock()
+        self.stats = {"new": 0, "reused": 0, "retried": 0}
+
+    def get(self, key: tuple, factory) -> tuple["_Conn", bool]:
+        now = time.monotonic()
+        with self.lock:
+            lst = self.idle.get(key, [])
+            while lst:
+                conn, t = lst.pop()
+                if now - t < self.ttl and conn.sock is not None:
+                    self.stats["reused"] += 1
+                    return conn, True
+                conn.close()
+            self.stats["new"] += 1
+        return factory(), False
+
+    def put(self, key: tuple, conn: "_Conn"):
+        with self.lock:
+            lst = self.idle.setdefault(key, [])
+            if len(lst) < self.max_idle:
+                lst.append((conn, time.monotonic()))
+                return
+        conn.close()
+
+    def drop(self, isolation: str):
+        """한 격리 키(사이트)의 유휴 연결만 닫는다."""
+        with self.lock:
+            for key in [k for k in self.idle if k[3] == isolation]:
+                for conn, _ in self.idle.pop(key):
+                    conn.close()
+
+    def clear(self):
+        with self.lock:
+            for lst in self.idle.values():
+                for conn, _ in lst:
+                    conn.close()
+            self.idle.clear()
+
+
+POOL = ConnPool()
+_RETRYABLE = (http.client.RemoteDisconnected, http.client.BadStatusLine, BrokenPipeError, ConnectionResetError,
+              ConnectionAbortedError, http.client.CannotSendRequest)
+
+
 class _Conn(http.client.HTTPConnection):
     def __init__(self, host, port, proxy, isolation, timeout, tls: bool):
         super().__init__(host, port, timeout=timeout)
@@ -138,7 +190,10 @@ def fetch(proxy: tuple[str, int], url: str, isolation: str, jar: CookieJar | Non
                 and sp.hostname not in secure_hosts):
             raise FetchError(f"HTTPS 전용 모드: 평문 HTTP로 가는 요청/리다이렉트를 막았습니다 ({url})")
         port = sp.port or (443 if sp.scheme == "https" else 80)
-        conn = _Conn(sp.hostname, port, proxy, isolation, timeout, sp.scheme == "https")
+        key = (sp.scheme, sp.hostname, port, isolation, proxy)
+
+        def factory():
+            return _Conn(sp.hostname, port, proxy, isolation, timeout, sp.scheme == "https")
         headers = dict(UNIFORM_HEADERS)
         if extra:
             headers.update(extra)
@@ -147,12 +202,26 @@ def fetch(proxy: tuple[str, int], url: str, isolation: str, jar: CookieJar | Non
             if c:
                 headers["Cookie"] = c
         path = (sp.path or "/") + (f"?{sp.query}" if sp.query else "")
-        try:
-            conn.request(method, path, body=body, headers=headers)
-            r = conn.getresponse()
-            data = r.read(MAX_BODY + 1)
-        finally:
+        for attempt in range(2):
+            conn, reused = POOL.get(key, factory)
+            try:
+                conn.request(method, path, body=body, headers=headers)
+                r = conn.getresponse()
+                data = r.read(MAX_BODY + 1)
+                break
+            except _RETRYABLE:
+                conn.close()
+                # 재사용한 연결이 그새 닫혔을 때만, 그리고 멱등 요청일 때만 새 연결로 한 번 더
+                if not (reused and method in ("GET", "HEAD") and attempt == 0):
+                    raise
+                POOL.stats["retried"] += 1
+            except Exception:
+                conn.close()
+                raise
+        if r.will_close or len(data) > MAX_BODY:
             conn.close()
+        else:
+            POOL.put(key, conn)
         if len(data) > MAX_BODY:
             raise FetchError("response too large")
         hdrs = r.getheaders()

@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import os
@@ -33,6 +34,7 @@ import time
 from dataclasses import dataclass
 
 from . import cells as K
+from . import directory as D
 from . import e2e as E
 from . import sphinx as S
 from . import split as P
@@ -66,6 +68,9 @@ PROFILES = {
     "balanced": Profile("balanced", 25, 3, 3, 100, 12, 2, (2, 3), (1, 2), 2, 3),
     "paranoid": Profile("paranoid", 10, 4, 4, 800, 8, 3, (3, 4), (2, 3), 3, 5),
 }
+
+
+INITIAL_SETS = 4
 
 
 class StreamError(Exception):
@@ -122,7 +127,10 @@ class MStream:
         self.up_seq = 0
         self.down_next = 0
         self.down_pending: dict[int, K.Cell] = {}
-        self.outstanding = 0        # 출구가 쥐고 있거나 전송 중인 SURB 묶음 수
+        self.sets: collections.deque[int] = collections.deque()   # 출구에 건넨 SURB 묶음들의 epoch (FIFO)
+        # SURB 창 슬로 스타트: 작게 시작해 실제로 데이터가 올 때마다 1씩 키운다 (왕복마다 약 2배).
+        # 작은 응답(이미지, API 호출)에 SURB를 과하게 미리 보내 상향 대역을 낭비하지 않는다.
+        self.target = min(INITIAL_SETS, client.profile.window)
         self.connected = asyncio.get_running_loop().create_future()
         self.data: asyncio.Queue[bytes | None] = asyncio.Queue()
         self.eof = False
@@ -145,10 +153,24 @@ class MStream:
         per = max(1, (self.max_data - 2) // (prof.reply_n * S.SURB_LEN))
         while nsets > 0:
             k = min(nsets, per)
-            sets = [self.c._make_surb_set(self) for _ in range(k)]
-            self._send(K.C_SURBS, K.pack_surb_sets(sets))
-            self.outstanding += k
+            epoch = self.c.surb_epoch()
+            sets = [self.c._make_surb_set(self, epoch) for _ in range(k)]
+            self._send(K.C_SURBS, K.pack_surb_sets(sets, epoch))
+            self.sets.extend([epoch] * k)
             nsets -= k
+
+    @property
+    def outstanding(self) -> int:
+        return len(self.sets)
+
+    def _refill(self):
+        """만료된 묶음(출구가 버릴 것)을 빼고, 창이 비면 새 묶음을 보낸다."""
+        cur = D.current_epoch()
+        while self.sets and self.sets[0] < cur:
+            self.sets.popleft()
+        w = self.target
+        if not self.eof and self.outstanding <= w - max(1, w // 4):
+            self._supply_surbs(w - self.outstanding)
 
     def _on_cell(self, cell: K.Cell):
         if cell.seq < self.down_next:
@@ -157,12 +179,14 @@ class MStream:
         while self.down_next in self.down_pending:
             c = self.down_pending.pop(self.down_next)
             self.down_next += 1
-            self.outstanding -= 1
+            if self.sets:
+                self.sets.popleft()
             if c.type == K.D_CONNECTED:
                 if not self.connected.done():
                     self.connected.set_result(True)
             elif c.type == K.D_DATA:
                 self.data.put_nowait(c.data)
+                self.target = min(self.c.profile.window, self.target + 1)
             elif c.type in (K.D_CLOSE, K.D_ERROR):
                 if not self.connected.done():
                     self.connected.set_exception(StreamError(c.data.decode(errors="replace") or "closed"))
@@ -170,12 +194,11 @@ class MStream:
                 self.data.put_nowait(None)
                 self.c._forget(self)
                 return
-        w = self.c.profile.window
-        if not self.eof and self.outstanding <= w - max(1, w // 4):
-            self._supply_surbs(w - self.outstanding)
+        self._refill()
 
     # ---------------------------------------------------------------- API
     async def write(self, data: bytes):
+        self._refill()          # 오래 쉬던 스트림: 응답을 받을 SURB가 만료됐을 수 있다
         step = self.max_data
         for i in range(0, len(data), step):
             self._send(K.C_DATA, data[i:i + step])
@@ -217,7 +240,7 @@ class MosaicClient:
         self.endpoints: dict[str, "EndpointDescriptor"] = {}     # 도메인 → 다중 입구 엔드포인트
         self.stats = {"sent_real": 0, "sent_cover": 0, "sent_loop": 0, "loops_back": 0,
                       "recv_real": 0, "recv_dummy": 0, "loop_rtt_ms": 0.0,
-                      "messages_split": 0, "fragments_sent": 0, "messages_reassembled": 0}
+                      "messages_split": 0, "fragments_sent": 0, "messages_reassembled": 0, "streams_opened": 0}
 
     # 호환용
     @property
@@ -243,9 +266,10 @@ class MosaicClient:
             self.lanes.append(lane)
             p = self.profile
             lane.tasks += [asyncio.create_task(self._payload_loop(lane)),
-                           asyncio.create_task(self._poisson(p.rate_loop, self._send_loop, lane)),
-                           asyncio.create_task(self._poisson(p.rate_drop, self._send_drop, lane))]
-        self.tasks += [asyncio.create_task(self._refresh_loop()), asyncio.create_task(self._gc_loop())]
+                           asyncio.create_task(self._poisson("rate_loop", self._send_loop, lane)),
+                           asyncio.create_task(self._poisson("rate_drop", self._send_drop, lane))]
+        self.tasks += [asyncio.create_task(self._refresh_loop()), asyncio.create_task(self._gc_loop()),
+                       asyncio.create_task(self._epoch_watch())]
         self.ready.set()
         log.info("client ready: gateways=%s profile=%s",
                  ",".join(l.gateway.node_id.hex()[:8] for l in self.lanes), self.profile.name)
@@ -279,14 +303,28 @@ class MosaicClient:
                 await asyncio.sleep(min(2 ** attempt, 30))
 
     async def _refresh_loop(self):
+        from . import directory as D
         while True:
-            await asyncio.sleep(60)
+            # epoch 키 로테이션을 따라가도록 epoch 길이보다 자주 받는다
+            await asyncio.sleep(min(60.0, max(1.0, D.EPOCH_LEN / 4)))
             try:
                 c = await fetch_consensus(self.authorities, self.threshold)
                 if c.usable():
                     self.consensus = c
             except Exception as e:      # noqa: BLE001
                 log.warning("consensus refresh failed: %s", e)
+
+    async def _epoch_watch(self):
+        """epoch가 바뀌면 열린 스트림마다 만료된 SURB 묶음을 새것으로 바꿔 보낸다.
+        스트림이 읽기만 기다리며 쉬고 있어도 출구가 응답할 SURB를 잃지 않는다."""
+        last = D.current_epoch()
+        while True:
+            await asyncio.sleep(min(1.0, max(0.1, D.EPOCH_LEN / 16)))
+            cur = D.current_epoch()
+            if cur != last:
+                last = cur
+                for st in list(self.streams.values()):
+                    st._refill()
 
     async def _gc_loop(self):
         while True:
@@ -311,10 +349,14 @@ class MosaicClient:
         off = random.randrange(len(self.lanes))
         return [self.lanes[(off + i) % len(self.lanes)] for i in range(n)]
 
+    def _fresh(self, d: Descriptor) -> Descriptor:
+        """링크·스트림이 쥐고 있는 기술자는 오래됐을 수 있다 (epoch 키가 바뀐다). 패킷을 만들 때마다 최신 합의로 바꾼다."""
+        return self.consensus.nodes.get(d.node_id, d)
+
     def _forward_packet(self, gw: Descriptor, mixes: list[Descriptor], final: Descriptor,
                         final_routing: S.Routing, body: bytes) -> bytes:
-        path = [gw] + mixes + [final]
-        hops = [S.Hop(d.node_id, d.sphinx_pk) for d in path]
+        path = [self._fresh(d) for d in [gw] + mixes + [final]]
+        hops = [S.Hop(d.node_id, d.sphinx_key()) for d in path]
         routes = [S.Routing(S.RELAY, self._delay(), path[i + 1].node_id, b"") for i in range(len(path) - 1)]
         pkt, _ = S.create_packet(hops, routes + [final_routing], body)
         return pkt
@@ -359,13 +401,22 @@ class MosaicClient:
         self.stats["messages_split"] += 1
         self.stats["fragments_sent"] += n
 
-    def _make_surb_set(self, stream: MStream) -> list[S.SURB]:
+    @staticmethod
+    def surb_epoch() -> int:
+        """새 SURB에 쓸 epoch. 노드는 다음 epoch 키를 미리 게시하므로, epoch의 마지막 1/4에는 다음 epoch 키로
+        만든다. 그러면 경계에서 모든 SURB가 한꺼번에 만료되지 않는다."""
+        now = time.time()
+        cur = D.current_epoch(now)
+        return cur + 1 if (now % D.EPOCH_LEN) > 0.75 * D.EPOCH_LEN else cur
+
+    def _make_surb_set(self, stream: MStream, epoch: int | None = None) -> list[S.SURB]:
         """응답 하나용 SURB n개. 경로가 서로 겹치지 않고 게이트웨이도 나눠 쓴다 (응답 마름모)."""
         n = self.profile.reply_n
+        epoch = self.surb_epoch() if epoch is None else epoch
         out = []
         for mixes, lane in zip(disjoint_paths(self.consensus, n), self._lanes_for(n)):
-            path = mixes + [lane.gateway]
-            hops = [S.Hop(d.node_id, d.sphinx_pk) for d in path]
+            path = [self._fresh(d) for d in mixes + [lane.gateway]]
+            hops = [S.Hop(d.node_id, d.sphinx_key(epoch)) for d in path]
             surb_id = os.urandom(S.SURB_ID_LEN)
             routes = [S.Routing(S.RELAY, self._delay(), path[i + 1].node_id, b"") for i in range(3)]
             routes.append(S.Routing(S.DELIVER_MAILBOX, 0, lane.mailbox, surb_id))
@@ -392,10 +443,13 @@ class MosaicClient:
             except asyncio.QueueEmpty:
                 await self._send_drop(lane)
 
-    async def _poisson(self, rate: float, fn, lane: Lane):
-        if rate <= 0:
-            return
+    async def _poisson(self, rate_attr: str, fn, lane: Lane):
+        """속도는 매번 현재 프로파일에서 읽는다 (보안 수준을 실행 중에 바꿀 수 있게)."""
         while True:
+            rate = getattr(self.profile, rate_attr)
+            if rate <= 0:
+                await asyncio.sleep(1)
+                continue
             await asyncio.sleep(random.expovariate(rate))
             await fn(lane)
 
@@ -494,6 +548,20 @@ class MosaicClient:
             d = self.exit_for[isolation] = random.choice(exits)
         return d
 
+    def set_profile(self, name: str) -> None:
+        """보안 수준을 실행 중에 바꾼다: 홉 지연, 커버 트래픽 속도, 분할 정책, SURB 창.
+        게이트웨이 수는 이미 연결된 링크를 유지한다 (바꾸려면 재시작)."""
+        if name not in PROFILES:
+            raise ValueError(f"unknown profile {name}")
+        self.profile = PROFILES[name]
+        for st in self.streams.values():
+            st.target = min(st.target, self.profile.window)
+        log.info("profile changed to %s", name)
+
+    def new_route(self, isolation: str) -> None:
+        """한 사이트(격리 키)만 새 출구로. 다른 사이트에는 영향을 주지 않는다."""
+        self.exit_for.pop(isolation, None)
+
     def new_identity(self):
         """모든 격리 키의 출구 매핑을 버린다. 이후 연결은 새 출구, 새 세션 id를 쓴다."""
         self.exit_for.clear()
@@ -511,7 +579,8 @@ class MosaicClient:
             st = MStream(self, self.exit_for_key(isolation or host), sid)
         self.streams[st.sid] = st
         st._send(K.C_OPEN, json.dumps({"host": host, "port": port, "reply_k": self.profile.reply_k}).encode())
-        st._supply_surbs(self.profile.window)
+        st._supply_surbs(st.target)
+        self.stats["streams_opened"] += 1
         try:
             await asyncio.wait_for(asyncio.shield(st.connected), timeout)
         except asyncio.TimeoutError as e:

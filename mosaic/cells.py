@@ -55,21 +55,26 @@ class Cell:
         return cls(t, s, q, b[HDR.size: HDR.size + n])
 
 
-def pack_surb_sets(sets: list[list[SURB]]) -> bytes:
-    """SURB 묶음: 한 묶음 = 응답 메시지 하나를 n개 조각으로 보낼, 경로가 서로 겹치지 않는 SURB n개."""
+def pack_surb_sets(sets: list[list[SURB]], epoch: int) -> bytes:
+    """SURB 묶음: 한 묶음 = 응답 메시지 하나를 n개 조각으로 보낼, 경로가 서로 겹치지 않는 SURB n개.
+    epoch = SURB를 만들 때 쓴 노드 키의 epoch. 노드가 그 키를 지우면 SURB도 못 쓰므로 받는 쪽이 버린다."""
     size = len(sets[0])
-    return bytes([len(sets), size]) + b"".join(s.pack() for st in sets for s in st)
+    return bytes([len(sets), size]) + struct.pack(">I", epoch) + b"".join(s.pack() for st in sets for s in st)
 
 
-def unpack_surb_sets(data: bytes) -> list[list[SURB]]:
+SETS_HDR = 6
+
+
+def unpack_surb_sets(data: bytes) -> tuple[list[list[SURB]], int]:
     count, size = data[0], data[1]
-    if not 1 <= size <= 16 or 2 + count * size * SURB_LEN > len(data):
+    if not 1 <= size <= 16 or SETS_HDR + count * size * SURB_LEN > len(data):
         raise ValueError("bad surb sets")
-    out, off = [], 2
+    epoch = struct.unpack_from(">I", data, 2)[0]
+    out, off = [], SETS_HDR
     for _ in range(count):
         st = []
         for _ in range(size):
             st.append(SURB.unpack(data[off: off + SURB_LEN]))
             off += SURB_LEN
         out.append(st)
-    return out
+    return out, epoch

@@ -48,3 +48,51 @@ def test_shell_routes():
         assert _get(br.url.replace(br.token, "wrong"))[0] == 404          # 토큰 없이는 접근 불가
     finally:
         br.stop()
+
+
+def test_profile_api_and_client_switch():
+    import pytest
+
+    from mosaic.client import PROFILES, MosaicClient
+
+    br = BrowserServer(("127.0.0.1", 1), "127.0.0.1", 17982)
+    br.start()
+    try:
+        req = urllib.request.Request(br.url + "api/profile?name=paranoid", method="POST")
+        with pytest.raises(urllib.error.HTTPError) as ei:       # 클라이언트 없이는 거부
+            OPENER.open(req, timeout=10)
+        assert ei.value.code == 400
+    finally:
+        br.stop()
+    c = MosaicClient([], 1)
+    c.set_profile("paranoid")
+    assert c.profile is PROFILES["paranoid"]
+    with pytest.raises(ValueError):
+        c.set_profile("turbo")
+    c.exit_for["user:site:example.com"] = object()
+    c.exit_for["user:site:other.org"] = object()
+    c.new_route("user:site:example.com")                        # 그 사이트만 새 출구
+    assert list(c.exit_for) == ["user:site:other.org"]
+
+
+def test_conn_pool_isolation():
+    from mosaic.browser.fetcher import ConnPool
+
+    class FakeConn:
+        def __init__(self):
+            self.sock, self.closed = object(), False
+
+        def close(self):
+            self.closed = True
+
+    pool = ConnPool()
+    a, b = FakeConn(), FakeConn()
+    pool.put(("https", "x.com", 443, "site:x.com", None), a)
+    pool.put(("https", "y.com", 443, "site:y.com", None), b)
+    # 다른 사이트(격리 키)의 연결은 절대 재사용되지 않는다
+    got, reused = pool.get(("https", "x.com", 443, "site:y.com", None), FakeConn)
+    assert not reused and got is not a
+    got, reused = pool.get(("https", "x.com", 443, "site:x.com", None), FakeConn)
+    assert reused and got is a
+    pool.drop("site:y.com")
+    assert b.closed
