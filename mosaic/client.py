@@ -112,7 +112,9 @@ class Lane:
 
     def __init__(self, gateway: Descriptor):
         self.gateway = gateway
-        self.mailbox = os.urandom(16)     # 게이트웨이마다 다른 id → 게이트웨이끼리 공모해도 연결 불가
+        # 게이트웨이마다 다른 우편함 → 게이트웨이끼리 공모해도 연결 불가. id = H(비밀값)이고 등록에는 비밀값이 필요하다
+        self.mailbox_secret = os.urandom(32)
+        self.mailbox = W.mailbox_id(self.mailbox_secret)
         self.link: W.Link | None = None
         self.queue: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
         self.tasks: list[asyncio.Task] = []
@@ -291,7 +293,7 @@ class MosaicClient:
     async def _connect(self, lane: Lane):
         g = lane.gateway
         lane.link = await W.connect(g.host, g.port, g.link_pk, g.mlkem_pk)
-        await lane.link.send(W.F_REGISTER, lane.mailbox)
+        await lane.link.send(W.F_REGISTER, lane.mailbox_secret)
         lane.tasks.append(asyncio.create_task(self._receiver(lane, lane.link)))
 
     async def _reconnect(self, lane: Lane):

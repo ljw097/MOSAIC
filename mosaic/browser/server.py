@@ -17,6 +17,7 @@ import json
 import logging
 import secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlencode, urlsplit  # noqa: F401
 
@@ -49,7 +50,8 @@ SECURITY_HEADERS = {
     "Cross-Origin-Opener-Policy": "same-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), interest-cohort=()",
 }
-PASS_TYPES = ("image/", "font/", "audio/", "video/", "text/plain", "application/pdf", "application/font",
+# PDF는 뺐다: 외부 뷰어로 열면 MOSAIC 밖에서 인터넷에 접속할 수 있으므로 다운로드 확인을 거친다
+PASS_TYPES = ("image/", "font/", "audio/", "video/", "text/plain", "application/font",
               "application/x-font", "application/vnd.ms-fontobject")
 MULTI_SUFFIX = {"co.kr", "or.kr", "go.kr", "ac.kr", "ne.kr", "re.kr", "co.uk", "org.uk", "ac.uk", "co.jp",
                 "ne.jp", "or.jp", "com.au", "net.au", "com.cn", "com.br", "co.in", "github.io"}
@@ -94,6 +96,8 @@ class BrowserServer:
         self.client, self.loop = client, loop
         self.token = secrets.token_urlsafe(16)
         self.jar = CookieJar()
+        self.downloads: dict[str, tuple[bytes, str, str, float]] = {}    # id → (본문, MIME, 파일명, 시각)
+        self.dl_lock = threading.Lock()
         self.httpd: ThreadingHTTPServer | None = None
 
     @property
@@ -262,6 +266,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._static(route[len("/static/"):], SHELL_CSP)
             elif route == "/start":
                 self._start()
+            elif route == "/download":
+                self._download(q.get("id", ""))
             elif route == "/go":
                 self._go(q.get("q", ""))
             elif route == "/api/status":
@@ -426,7 +432,7 @@ class Handler(BaseHTTPRequestHandler):
                      "<p>출구가 내용을 전혀 볼 수 없는 연결: <b>HTTPS</b>, <b>.mosaic</b>, <b>◇ 다중 입구</b> 사이트.</p>",
                      acts, warn=True)
 
-    def _deliver(self, r, top: str):
+    def _deliver(self, r, top: str, view: bool = True):
         s = self.server_ref
         ctype = r.header("Content-Type", "application/octet-stream")
         mime = ctype.split(";")[0].strip().lower()
@@ -448,9 +454,43 @@ class Handler(BaseHTTPRequestHandler):
             if mime == "image/svg+xml":
                 extra["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; sandbox"
             self._send(r.status, r.body, mime, extra)
+        elif not view:
+            self._send(204, b"", "text/plain")       # 하위 리소스로 받은 파일은 저장시키지 않는다
         else:
-            self._send(r.status, r.body, "application/octet-stream",
-                       {"Content-Disposition": "attachment"})
+            self._download_prompt(r, mime)
+
+    def _download_prompt(self, r, mime: str):
+        """파일을 저장하기 전에 경고한다. 외부 프로그램(PDF·오피스·미디어 플레이어)은 문서 안의 링크·이미지를
+        MOSAIC을 거치지 않고 직접 불러와 IP를 드러낼 수 있다 (Tor Browser도 같은 경고를 한다)."""
+        s = self.server_ref
+        name = _filename(r)
+        did = secrets.token_urlsafe(12)
+        with s.dl_lock:
+            now = time.time()
+            s.downloads = {k: v for k, v in s.downloads.items() if now - v[3] < 600}
+            while len(s.downloads) >= 20 or sum(len(v[0]) for v in s.downloads.values()) > 200 * 1024 * 1024:
+                s.downloads.pop(next(iter(s.downloads)))
+            s.downloads[did] = (r.body, mime, name, now)
+        size = len(r.body)
+        human = f"{size / 1048576:.1f} MB" if size > 1048576 else f"{size / 1024:.0f} KB"
+        self._notice("파일 다운로드", "이 파일을 저장할까요?", r.url,
+                     f"<p><b>{html.escape(name)}</b> · {html.escape(mime)} · {human}</p>"
+                     "<p>이 파일은 믹스넷으로 받았습니다. 하지만 <b>파일을 여는 프로그램</b>(PDF 뷰어, 오피스, 미디어 "
+                     "플레이어 등)은 문서에 들어 있는 링크나 이미지를 MOSAIC을 거치지 않고 직접 불러올 수 있고, "
+                     "그러면 실제 IP가 드러납니다. 인터넷이 끊긴 상태에서 열거나, 격리된 환경에서 여는 것을 권합니다.</p>",
+                     [("primary", f"{s.prefix}/download?id={did}", "위험을 이해하고 저장"),
+                      ("quiet", f"{s.prefix}/start", "취소")], warn=True)
+
+    def _download(self, did: str):
+        s = self.server_ref
+        with s.dl_lock:
+            item = s.downloads.pop(did, None)
+        if item is None:
+            self._send(404, "만료된 다운로드입니다".encode(), "text/plain; charset=utf-8")
+            return
+        body, _mime, name, _t = item
+        self._send(200, body, "application/octet-stream",
+                   {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(name, safe='')}"})
 
     def _res(self, url: str, top: str):
         s = self.server_ref
@@ -472,7 +512,7 @@ class Handler(BaseHTTPRequestHandler):
         if mime in ("application/javascript", "text/javascript", "application/x-javascript", "text/html"):
             self._send(204, b"", "text/plain")   # 스크립트/문서는 리소스로 쓰지 않는다
             return
-        self._deliver(r, top)
+        self._deliver(r, top, view=False)
 
     def _form(self, method: str, q: dict, body: bytes | None):
         if method == "GET":
@@ -491,6 +531,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         data = urlencode([(k, v) for k, vs in fields.items() for v in vs]).encode()
         self._view(target, "POST", data, "application/x-www-form-urlencoded")
+
+
+def _filename(r) -> str:
+    import os.path
+    import re
+    cd = r.header("Content-Disposition", "")
+    m = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", cd, re.I)
+    name = m.group(1) if m else os.path.basename(urlsplit(r.url).path) or "download"
+    from urllib.parse import unquote
+    name = unquote(name).replace("/", "_").replace("\\", "_").strip(". ") or "download"
+    return name[:120]
 
 
 def _charset(ctype: str, body: bytes) -> str:

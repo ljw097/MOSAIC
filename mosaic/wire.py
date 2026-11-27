@@ -30,7 +30,7 @@ FRAME_CT = FRAME_PT + 16
 # 프레임 타입
 F_PACKET = 1      # Sphinx 패킷
 F_DELIVER = 2     # 게이트웨이 -> 클라이언트: surb_id(8) || payload(2048)
-F_REGISTER = 3    # 클라이언트 -> 게이트웨이: mailbox id(16)
+F_REGISTER = 3    # 클라이언트 -> 게이트웨이: mailbox secret(32). 우편함 id = mailbox_id(secret)
 F_DUMMY = 4       # 링크 커버 트래픽
 F_ENDPOINT_FRAG = 6   # 출구 -> 엔드포인트 입구: 조각 하나 (E2E 암호문의 일부)
 F_FORWARD = 5     # 클라이언트(서비스) -> 게이트웨이: target(16) || SURB 패킷. 게이트웨이가 대신 첫 홉으로 전달
@@ -144,6 +144,11 @@ async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, sta
     writer.write(er_pk + C.mac(k_c, b"responder-confirm"))
     await writer.drain()
     return Link(reader, writer, k_ri, k_ir)
+
+
+def mailbox_id(secret: bytes) -> bytes:
+    """우편함 id는 비밀값의 해시다. 서비스처럼 id가 공개돼도, 비밀값을 아는 쪽만 그 우편함을 등록(수신)할 수 있다."""
+    return C.h(b"MOSAIC mailbox", secret, n=16)
 
 
 def pack_deliver(surb_id: bytes, payload: bytes) -> bytes:

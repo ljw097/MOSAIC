@@ -30,6 +30,8 @@ from .exit import ExitService
 
 log = logging.getLogger("mosaic.service")
 PENDING_LIMIT = 64
+MAX_SESSIONS = 20_000
+SESSION_IDLE = 600
 
 
 class _ServiceExit(ExitService):
@@ -58,6 +60,8 @@ class E2EReceiver:
         self.exit.reply_overhead = E.OVERHEAD
         self.reasm = P.Reassembler()
         self.sessions: dict[bytes, E.ServerSession] = {}
+        self.last_used: dict[bytes, float] = {}
+        self.tombstones: dict[bytes, float] = {}    # 정리된 연결 id: 재전송된 INIT으로 되살리지 못하게
         self.waiting: dict[bytes, list[tuple[float, bytes]]] = {}
         self.stats = {"fragments": 0, "messages": 0, "e2e_fail": 0}
 
@@ -73,6 +77,13 @@ class E2EReceiver:
 
     def gc(self):
         now = time.time()
+        # 끝났거나 오래 쉰 E2E 세션 정리 (전에는 무한히 쌓였다)
+        for conn in [c for c, t in self.last_used.items()
+                     if now - t > SESSION_IDLE and c not in self.exit.sessions]:
+            self.sessions.pop(conn, None)
+            self.last_used.pop(conn, None)
+            self.tombstones[conn] = now
+        self.tombstones = {c: t for c, t in self.tombstones.items() if now - t < 2 * E.INIT_MAX_AGE}
         self.reasm.gc()
         self.waiting = {c: [(t, m) for t, m in v if now - t < 60] for c, v in self.waiting.items()}
         self.waiting = {c: v for c, v in self.waiting.items() if v}
@@ -84,7 +95,7 @@ class E2EReceiver:
         t, conn = info
         try:
             if t == E.T_INIT:
-                if conn in self.sessions:
+                if conn in self.sessions or conn in self.tombstones or len(self.sessions) >= MAX_SESSIONS:
                     return
                 sess, pt = E.ServerSession.accept(msg, self._x25519_sk, self._mlkem_seed)
                 self.sessions[conn] = sess
@@ -103,6 +114,7 @@ class E2EReceiver:
             self.stats["e2e_fail"] += 1
 
     def _deliver(self, conn: bytes, pt: bytes):
+        self.last_used[conn] = time.time()
         try:
             cell = K.Cell.unpack(pt)
         except ValueError:

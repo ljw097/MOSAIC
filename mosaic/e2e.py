@@ -19,16 +19,18 @@ from __future__ import annotations
 import base64
 import os
 import struct
+import time
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
 from . import crypto as C
 
 T_INIT, T_UP, T_DOWN = 0xE1, 0xE2, 0xE3
+INIT_MAX_AGE = 600          # INIT 타임스탬프 허용 범위(초). 녹화된 INIT을 나중에 재전송해 요청을 반복시키는 공격 방지
 _HDR = struct.Struct(">B16s12s")
 OVERHEAD = _HDR.size + 16                                   # 45
 INIT_EXTRA = 32 + C.MLKEM_CT_LEN                            # 1120
-INIT_OVERHEAD = OVERHEAD + INIT_EXTRA
+INIT_OVERHEAD = OVERHEAD + INIT_EXTRA + 8
 
 
 class E2EError(Exception):
@@ -78,7 +80,8 @@ class ClientSession:
     def seal(self, cell: bytes) -> bytes:
         if not self.sent_init:
             self.sent_init = True
-            return _seal(self.k_up, T_INIT, self.conn, cell, self.e_pk + self.ct)
+            ts = struct.pack(">Q", int(time.time()))      # AEAD 안: 위조·변조 불가
+            return _seal(self.k_up, T_INIT, self.conn, ts + cell, self.e_pk + self.ct)
         return _seal(self.k_up, T_UP, self.conn, cell)
 
     def open(self, msg: bytes) -> bytes:
@@ -105,7 +108,11 @@ class ServerSession:
             raise E2EError("bad INIT") from e
         k_up, k_down = _keys(ss1, ss2, conn, e_pk, ct, C.x25519_pub(x25519_sk))
         s = cls(conn, k_up, k_down)
-        return s, _open(k_up, msg, INIT_EXTRA)
+        pt = _open(k_up, msg, INIT_EXTRA)
+        ts = struct.unpack(">Q", pt[:8])[0]
+        if abs(time.time() - ts) > INIT_MAX_AGE:
+            raise E2EError("stale INIT (replay?)")
+        return s, pt[8:]
 
     def open(self, msg: bytes) -> bytes:
         if msg[0] != T_UP or msg[1:17] != self.conn:

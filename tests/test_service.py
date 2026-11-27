@@ -135,3 +135,38 @@ def test_mosaic_service_without_exit(monkeypatch):
         assert all(m[0] in (E.T_INIT, E.T_UP) and SECRET not in m for m in recovered)
 
     asyncio.run(run())
+
+
+def test_init_replay_after_gc_rejected(monkeypatch):
+    """세션 정리 후에도 녹화된 INIT을 재전송해 요청을 다시 실행시킬 수 없다."""
+    import time as _t
+
+    from mosaic.service import E2EReceiver
+    from mosaic import cells as K
+
+    k = ServiceKeys.generate()
+
+    class Rx(E2EReceiver):
+        async def send_packet(self, first_hop, packet):
+            pass
+
+    rx = Rx(k.x25519_sk, k.mlkem_seed, ("127.0.0.1", 9))
+    delivered = []
+    rx.exit.on_cell = lambda cell: delivered.append(cell)
+    conn = b"c" * 16
+    init = E.ClientSession(conn, k.x25519_pk, k.mlkem_pk).seal(K.Cell(K.C_OPEN, conn, 0, b"{}").pack())
+    rx._on_message(init)
+    assert len(delivered) == 1
+    rx._on_message(init)                          # 같은 INIT 재전송: 무시
+    assert len(delivered) == 1
+    rx.last_used[conn] = _t.time() - 10_000       # 오래 쉰 세션 → 정리
+    rx.gc()
+    assert conn not in rx.sessions and conn in rx.tombstones
+    rx._on_message(init)                          # 정리 뒤 재전송: 묘비로 거부
+    assert len(delivered) == 1
+    # 오래된 INIT(타임스탬프 만료)은 묘비가 없어도 거부
+    monkeypatch.setattr(_t, "time", lambda: 1_000_000.0)
+    old = E.ClientSession(b"d" * 16, k.x25519_pk, k.mlkem_pk).seal(b"x")
+    monkeypatch.undo()
+    with pytest.raises(E.E2EError):
+        E.ServerSession.accept(old, k.x25519_sk, k.mlkem_seed)

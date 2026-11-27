@@ -214,7 +214,8 @@ class Node:
                     self.stats["relayed"] += 1
                     asyncio.create_task(self.pool.send(target, pkt))
                 elif ftype == W.F_REGISTER and self.role == "gateway":
-                    mailbox_id = body[:16]
+                    # 비밀값 증명: 공개된 우편함 id(예: 서비스 intro)만으로는 남의 우편함을 가로챌 수 없다
+                    mailbox_id = W.mailbox_id(body[:32])
                     mb = self.mailboxes.setdefault(mailbox_id, Mailbox())
                     mb.link = link
                     self.tasks.append(asyncio.create_task(self._downstream(mailbox_id, mb, link)))

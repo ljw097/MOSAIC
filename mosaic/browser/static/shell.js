@@ -63,7 +63,8 @@
     const t = { id: ++seq, url: url || "", title: "새 탭", loading: false };
     t.frame = document.createElement("iframe");
     // allow-scripts는 절대 주지 않는다. same-origin은 주소·제목 동기화용 (스크립트가 없으니 안전)
-    t.frame.setAttribute("sandbox", "allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox");
+    // 팝업 권한도 주지 않는다: 새 창은 셸이 MOSAIC 탭으로 연다
+    t.frame.setAttribute("sandbox", "allow-same-origin allow-forms");
     t.frame.setAttribute("referrerpolicy", "no-referrer");
     t.frame.title = "페이지 내용";
     t.frame.addEventListener("load", () => onLoad(t));

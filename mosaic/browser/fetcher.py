@@ -83,16 +83,18 @@ class CookieJar:
     jars: dict[str, dict[str, dict[str, str]]] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def header(self, top: str, host: str) -> str:
+    def header(self, top: str, host: str, secure: bool = True) -> str:
+        """secure=False(평문 HTTP)이면 Secure 쿠키는 보내지 않는다. 출구가 세션 쿠키를 훔쳐보지 못하게."""
         with self.lock:
             j = self.jars.get(top, {})
             out = {}
             for dom, cookies in j.items():
                 if host == dom or host.endswith("." + dom):
-                    out.update(cookies)
+                    out.update({k: v for k, (v, sec) in cookies.items() if secure or not sec})
             return "; ".join(f"{k}={v}" for k, v in out.items())
 
-    def store(self, top: str, host: str, set_cookies: list[str]):
+    def store(self, top: str, host: str, set_cookies: list[str], secure: bool = True):
+        from .server import MULTI_SUFFIX
         with self.lock:
             j = self.jars.setdefault(top, {})
             for sc in set_cookies:
@@ -100,17 +102,36 @@ class CookieJar:
                 if "=" not in parts[0]:
                     continue
                 name, value = parts[0].split("=", 1)
+                name = name.strip()
+                attrs = {p.split("=", 1)[0].strip().lower(): (p.split("=", 1)[1].strip() if "=" in p else "")
+                         for p in parts[1:]}
+                is_secure = "secure" in attrs or name.startswith(("__Secure-", "__Host-"))
+                if is_secure and not secure:
+                    continue                       # 평문 응답이 Secure 쿠키를 심는 것은 거부 (RFC 6265bis)
                 dom = host
-                for p in parts[1:]:
-                    if p.lower().startswith("domain="):
-                        d = p[7:].lstrip(".").lower()
-                        if host == d or host.endswith("." + d):
-                            dom = d
-                j.setdefault(dom, {})[name] = value
+                d = attrs.get("domain", "").lstrip(".").lower()
+                # 공개 접미사(co.kr, com 등)에는 쿠키를 걸 수 없다
+                if d and (host == d or host.endswith("." + d)) and "." in d and d not in MULTI_SUFFIX \
+                        and not name.startswith("__Host-"):
+                    dom = d
+                try:
+                    expired = "max-age" in attrs and int(attrs["max-age"]) <= 0
+                except ValueError:
+                    expired = False
+                if expired:
+                    j.get(dom, {}).pop(name, None)
+                else:
+                    j.setdefault(dom, {})[name] = (value, is_secure)
 
     def clear(self):
         with self.lock:
             self.jars.clear()
+
+
+def _secure_transport(sp, secure_hosts) -> bool:
+    """출구가 내용을 볼 수 없는 연결인가: TLS, .mosaic(E2E), 다중 입구 엔드포인트(E2E)."""
+    h = sp.hostname or ""
+    return sp.scheme == "https" or h.endswith(".mosaic") or h in secure_hosts
 
 
 class ConnPool:
@@ -198,7 +219,7 @@ def fetch(proxy: tuple[str, int], url: str, isolation: str, jar: CookieJar | Non
         if extra:
             headers.update(extra)
         if jar is not None:
-            c = jar.header(top, sp.hostname)
+            c = jar.header(top, sp.hostname, secure=_secure_transport(sp, secure_hosts))
             if c:
                 headers["Cookie"] = c
         path = (sp.path or "/") + (f"?{sp.query}" if sp.query else "")
@@ -226,7 +247,8 @@ def fetch(proxy: tuple[str, int], url: str, isolation: str, jar: CookieJar | Non
             raise FetchError("response too large")
         hdrs = r.getheaders()
         if jar is not None:
-            jar.store(top, sp.hostname, [v for k, v in hdrs if k.lower() == "set-cookie"])
+            jar.store(top, sp.hostname, [v for k, v in hdrs if k.lower() == "set-cookie"],
+                      secure=_secure_transport(sp, secure_hosts))
         enc = r.getheader("Content-Encoding", "").lower()
         try:
             if enc == "gzip":

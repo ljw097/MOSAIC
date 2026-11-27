@@ -288,8 +288,11 @@ class Authority:
                 "sig": C.ed_sign(self.sk, b"MOSAIC-consensus" + canonical(doc)).hex()}
 
 
+MAX_DOC = 64 * 1024 * 1024      # 합의 문서 최대 크기. 기본 readline 한도(64KB)로는 노드가 20개만 넘어도 받지 못한다
+
+
 async def _request(host: str, port: int, req: dict, timeout: float = 10) -> dict:
-    r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    r, w = await asyncio.wait_for(asyncio.open_connection(host, port, limit=MAX_DOC), timeout)
     try:
         w.write(canonical(req) + b"\n")
         await w.drain()
