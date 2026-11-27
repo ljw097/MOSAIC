@@ -97,6 +97,7 @@ class BrowserServer:
         self.token = secrets.token_urlsafe(16)
         self.jar = CookieJar()
         self.downloads: dict[str, tuple[bytes, str, str, float]] = {}    # id → (본문, MIME, 파일명, 시각)
+        self.http_ok: set[str] = set()      # 이번 세션에 사용자가 평문 HTTP를 허락한 사이트 (새 신원이면 지움)
         self.dl_lock = threading.Lock()
         self.httpd: ThreadingHTTPServer | None = None
 
@@ -158,6 +159,7 @@ class BrowserServer:
         from .fetcher import POOL
         self.jar.clear()
         POOL.clear()            # 기존 스트림(=기존 출구)을 재사용하지 않는다
+        self.http_ok.clear()
         if self.client and self.loop:
             self.loop.call_soon_threadsafe(self.client.new_identity)
 
@@ -266,6 +268,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._static(route[len("/static/"):], SHELL_CSP)
             elif route == "/start":
                 self._start()
+            elif route == "/blocked":
+                self._notice("차단됨", "믹스넷 밖으로 나가는 이동을 막았습니다", "",
+                             "<p>이 페이지가 MOSAIC 프록시를 거치지 않고 다른 주소로 직접 이동하려 했습니다. 그대로 두면 "
+                             "실제 IP가 드러나므로 셸이 이동을 되돌렸습니다. 정화기를 우회한 링크일 수 있으니, "
+                             "가능하면 이 사이트의 다른 경로를 이용하세요.</p>",
+                             [("quiet", f"{s.prefix}/start", "새 탭으로")], warn=True)
             elif route == "/download":
                 self._download(q.get("id", ""))
             elif route == "/go":
@@ -406,6 +414,10 @@ class Handler(BaseHTTPRequestHandler):
         if sp.scheme not in ("http", "https") or not sp.hostname:
             self._err("http/https 주소만 지원합니다.", 400, raw)
             return
+        site = site_of(sp.hostname)
+        if ok and sp.scheme == "http":
+            s.http_ok.add(site)          # 한 번 허락하면 같은 사이트의 다른 페이지에서 다시 묻지 않는다
+        ok = ok or site in s.http_ok
         if not is_secure(url, s.endpoint_domains()) and not ok:
             self._https_only(url, method)
             return
@@ -499,12 +511,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b"", "text/plain")
             return
         top = top or site_of(sp.hostname or "")
-        if not is_secure(url, s.endpoint_domains()):
+        http_ok = site_of(sp.hostname or "") in s.http_ok
+        if not is_secure(url, s.endpoint_domains()) and not http_ok:
             self._send(204, b"", "text/plain")    # 평문 HTTP 하위 리소스 차단 (출구가 읽을 수 있음)
             return
         try:
             r = fetch(s.socks, url, "site:" + top, s.jar, top, extra={"Accept": "*/*"},
-                      secure_hosts=s.endpoint_domains())
+                      secure_hosts=s.endpoint_domains(), allow_insecure=http_ok)
         except Exception:      # noqa: BLE001
             self._send(502, b"", "text/plain")
             return

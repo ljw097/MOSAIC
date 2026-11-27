@@ -13,6 +13,8 @@
     lock: '<svg viewBox="0 0 16 16"><rect x="3" y="7" width="10" height="7" rx="1.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>',
     warn: '<svg viewBox="0 0 16 16"><path d="M8 2l6.5 11.5h-13z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8 6.5v3.2M8 11.6v.1" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
     search: '<svg viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10.5 10.5L14 14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>',
+    arrow: '<svg viewBox="0 0 16 16"><path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+    clock: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 5v3.2l2 1.3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
     x: '<svg viewBox="0 0 16 16" width="12" height="12"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   };
 
@@ -109,6 +111,8 @@
 
   function go(t, url) {
     t.url = url || "";
+    t.blocked = {};
+    t.guarded = 0;
     t.loading = true;
     t.ready = false;
     t.frame.src = url ? viewURL(url) : P + "/start";
@@ -116,9 +120,90 @@
     if (t === active) syncChrome();
   }
 
+  // ------------------------------------------------------------------ 탐색 가드 (정화기 뒤의 두 번째 방어선)
+  // 페이지 안의 링크·폼은 모두 이 프록시 경로(/token/…)여야 한다. 그 밖으로 가는 이동은 믹스넷을 거치지 않는
+  // 직접 연결(=실제 IP 노출)이므로, 셸이 클릭·제출 단계에서 막는다. 페이지 스크립트는 꺼져 있어 이 감시를 못 끈다.
+  function proxied(href) {
+    try {
+      const u = new URL(href, location.href);
+      return u.origin === location.origin && u.pathname.startsWith(P + "/");
+    } catch { return false; }
+  }
+  function targetOf(href) {
+    try {
+      const u = new URL(href, location.href);
+      if (u.pathname === P + "/view") return u.searchParams.get("u") || "";
+    } catch { /* */ }
+    return "";
+  }
+  function blockNav(t, what) {
+    t.guarded = (t.guarded || 0) + 1;
+    toast("믹스넷 밖으로 직접 나가는 " + what + "을 막았습니다");
+    renderTab(t);
+    if (t === active) syncChrome();
+  }
+
+  function hookDocument(t) {
+    let d;
+    try { d = t.frame.contentDocument; } catch { return; }
+    if (!d || d.__mosaic) return;
+    d.__mosaic = true;
+    const meta = d.querySelectorAll('meta[name="mosaic-blocked"]');
+    t.blocked = {};
+    if (meta.length) {
+      for (const kv of (meta[meta.length - 1].content || "").split(";")) {
+        const [k, v] = kv.split("=");
+        if (k) t.blocked[k] = Number(v) || 0;
+      }
+    }
+    const linkOf = (e) => e.target && e.target.closest ? e.target.closest("a[href], area[href]") : null;
+    const onClick = (e) => {
+      const a = linkOf(e);
+      if (!a) return;
+      const href = a.getAttribute("href") || "";
+      if (href.startsWith("#")) return;
+      if (!proxied(a.href)) { e.preventDefault(); e.stopPropagation(); blockNav(t, "링크"); return; }
+      const dest = targetOf(a.href);
+      if (dest && (e.button === 1 || e.ctrlKey || e.metaKey)) {    // 새 탭(백그라운드)
+        e.preventDefault(); e.stopPropagation();
+        newTab(dest, e.shiftKey);
+        toast("새 탭에서 열었습니다");
+      }
+    };
+    d.addEventListener("click", onClick, true);
+    d.addEventListener("auxclick", onClick, true);
+    d.addEventListener("submit", (e) => {
+      const f = e.target;
+      const action = (e.submitter && e.submitter.formAction) || f.action;
+      if (!proxied(action)) { e.preventDefault(); e.stopPropagation(); blockNav(t, "폼 제출"); }
+    }, true);
+    d.addEventListener("mouseover", (e) => {
+      const a = linkOf(e);
+      if (!a || t !== active) return;
+      const dest = targetOf(a.href);
+      showStatus(dest || (proxied(a.href) ? "" : "⛔ 차단됨: " + a.href));
+    }, true);
+    d.addEventListener("mouseout", (e) => { if (linkOf(e)) showStatus(""); }, true);
+    renderTab(t);
+    if (t === active) syncChrome();
+  }
+
+  const statusEl = $("status");
+  function showStatus(text) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle("show", !!text);
+  }
+
   function onLoad(t) {
     if (!t.el) return;                         // iframe를 붙이는 순간 발생하는 about:blank 로드
-    try { if (t.frame.contentWindow.location.href === "about:blank") return; } catch { /* */ }
+    try {
+      if (t.frame.contentWindow.location.href === "about:blank") return;
+    } catch {
+      // 프레임이 우리 출처를 벗어났다 = 어떤 경로로든 직접 연결이 일어났다. 즉시 되돌리고 알린다.
+      t.frame.src = P + "/blocked";
+      blockNav(t, "이동");
+      return;
+    }
     t.loading = false;
     t.url = realURL(t.frame);
     let title = "";
@@ -130,6 +215,8 @@
         t.loading = true; t.ready = false; renderTab(t); if (t === active) syncChrome();
       });
     } catch { /* */ }
+    hookDocument(t);
+    remember(t);
     renderTab(t);
     if (t === active) syncChrome();
   }
@@ -149,13 +236,20 @@
     t.el.title = t.title + (t.url ? "\n" + t.url : "");
   }
 
+  function blockedTotal(t) {
+    if (!t) return 0;
+    return Object.values(t.blocked || {}).reduce((a, b) => a + b, 0) + (t.guarded || 0);
+  }
+
   function syncChrome() {
     if (!active) return;
     if (document.activeElement !== addr) addr.value = active.url;
     const k = kindOf(active.url);
     const meta = KIND[k];
     chip.className = "chip " + k;
-    chip.innerHTML = meta.icon + (meta.label ? '<span class="txt">' + meta.label + "</span>" : "");
+    const n = blockedTotal(active);
+    chip.innerHTML = meta.icon + (meta.label ? '<span class="txt">' + meta.label + "</span>" : "") +
+      (n ? `<span class="count" title="이 페이지에서 차단한 항목">${n > 99 ? "99+" : n}</span>` : "");
     chip.title = meta.title + " — 눌러서 경로 보기";
     document.title = (active.title && active.url ? active.title + " — " : "") + "MOSAIC";
     progress.className = "progress " + (active.loading ? "loading" : "done");
@@ -172,7 +266,7 @@
         const d = t.frame.contentDocument;
         if (!d || d.readyState === "loading" || t.frame.contentWindow.location.href === "about:blank") continue;
         const u = realURL(t.frame), title = d.title;
-        if (!t.ready) { t.ready = true; renderTab(t); }   // 문서 준비 완료: 탭 스피너는 멈추고 진행 막대만 이미지를 기다린다
+        if (!t.ready) { t.ready = true; hookDocument(t); renderTab(t); }   // 문서 준비 완료: 탭 스피너는 멈추고 진행 막대만 이미지를 기다린다
         if ((title && title !== t.title) || u !== t.url) {
           t.url = u;
           t.title = title || (u ? hostOf(u) : "새 탭");
@@ -183,14 +277,71 @@
     }
   }, 250);
 
+  // ------------------------------------------------------------------ 방문 기록 (메모리에만, 새 신원이면 지움)
+  let history = [];
+  function remember(t) {
+    if (!t.url) return;
+    history = history.filter((h) => h.url !== t.url);
+    history.unshift({ url: t.url, title: t.title || hostOf(t.url) });
+    if (history.length > 200) history.length = 200;
+  }
+
+  // ------------------------------------------------------------------ 주소창 제안
+  const sug = $("suggest");
+  let sugItems = [], sugIdx = -1;
+  function renderSuggest() {
+    const q = addr.value.trim().toLowerCase();
+    if (!q || document.activeElement !== addr) { sug.classList.remove("open"); sugItems = []; return; }
+    const target = normalize(addr.value);
+    const isSearch = target && target.startsWith("https://html.duckduckgo.com/");
+    sugItems = [{ url: target, title: isSearch ? `"${addr.value.trim()}" 검색` : target, kind: isSearch ? "search" : "go" }];
+    for (const h of history) {
+      if (sugItems.length >= 7) break;
+      if (h.url !== target && (h.url.toLowerCase().includes(q) || h.title.toLowerCase().includes(q))) {
+        sugItems.push({ url: h.url, title: h.title, kind: "hist" });
+      }
+    }
+    sugIdx = 0;
+    const ico = { search: ICON.search, go: ICON.arrow, hist: ICON.clock };
+    sug.innerHTML = sugItems.map((it, i) =>
+      `<div class="item${i === sugIdx ? " sel" : ""}" data-i="${i}">${ico[it.kind]}<span class="t">${esc(it.title)}</span>` +
+      (it.kind === "hist" ? `<span class="u">${esc(it.url)}</span>` : "") + `<span class="k ${kindOf(it.url)}">${esc(KIND[kindOf(it.url)].label)}</span></div>`).join("");
+    sug.classList.add("open");
+  }
+  function pickSuggest(i) {
+    const it = sugItems[i];
+    if (!it || !active) return;
+    sug.classList.remove("open");
+    go(active, it.url);
+    addr.blur();
+    active.frame.focus();
+  }
+  sug.addEventListener("mousedown", (e) => {
+    const el = e.target.closest(".item");
+    if (el) { e.preventDefault(); pickSuggest(Number(el.dataset.i)); }
+  });
+
   // ------------------------------------------------------------------ 탐색
   $("omnibox").addEventListener("submit", (e) => {
     e.preventDefault();
+    if (sug.classList.contains("open") && sugIdx > 0) return pickSuggest(sugIdx);
+    sug.classList.remove("open");
     const u = normalize(addr.value);
     if (u && active) { go(active, u); addr.blur(); active.frame.focus(); }
   });
   addr.addEventListener("focus", () => addr.select());
-  addr.addEventListener("keydown", (e) => { if (e.key === "Escape") { addr.value = active.url; addr.blur(); } });
+  addr.addEventListener("input", renderSuggest);
+  addr.addEventListener("blur", () => setTimeout(() => sug.classList.remove("open"), 120));
+  addr.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { sug.classList.remove("open"); addr.value = active.url; addr.blur(); return; }
+    if (!sug.classList.contains("open") || !sugItems.length) return;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      sugIdx = (sugIdx + (e.key === "ArrowDown" ? 1 : -1) + sugItems.length) % sugItems.length;
+      sug.querySelectorAll(".item").forEach((el, i) => el.classList.toggle("sel", i === sugIdx));
+      addr.value = sugItems[sugIdx].kind === "search" ? addr.value : sugItems[sugIdx].url;
+    }
+  });
   $("back").addEventListener("click", () => { try { active.frame.contentWindow.history.back(); } catch { /* */ } });
   $("fwd").addEventListener("click", () => { try { active.frame.contentWindow.history.forward(); } catch { /* */ } });
   $("reload").addEventListener("click", () => {
@@ -221,7 +372,8 @@
   $("newid").addEventListener("click", async () => {
     try {
       await fetch(P + "/api/newid", { method: "POST" });
-      toast("새 신원: 쿠키를 지웠고 모든 사이트가 새 출구를 씁니다");
+      history = [];
+      toast("새 신원: 쿠키와 방문 기록을 지웠고 모든 사이트가 새 출구를 씁니다");
       for (const t of tabs) if (t.url) go(t, t.url);
     } catch { toast("실패했습니다"); }
   });
@@ -283,6 +435,19 @@
     return s + "</svg>";
   }
 
+  const BLOCK_LABEL = {
+    scripts: "스크립트", handlers: "이벤트 핸들러(onclick 등)", frames: "iframe·플러그인",
+    bad_urls: "위험한 URL(javascript: 등)", animations: "SVG 애니메이션(링크 변조)", refresh: "자동 이동(meta refresh)",
+  };
+  function blockedHTML(t) {
+    if (!t || !t.url) return "";
+    const rows = Object.entries(t.blocked || {}).filter(([, v]) => v > 0)
+      .map(([k, v]) => `<li><span>${esc(BLOCK_LABEL[k] || k)}</span><b>${v}</b></li>`);
+    if (t.guarded) rows.push(`<li class="warn"><span>믹스넷 밖으로 나가려던 이동</span><b>${t.guarded}</b></li>`);
+    if (!rows.length) return `<div class="blocked none">이 페이지에서 제거할 위험 요소가 없었습니다.</div>`;
+    return `<div class="blocked"><h4>이 페이지에서 차단함</h4><ul>${rows.join("")}</ul></div>`;
+  }
+
   function renderPop() {
     const u = active ? active.url : "", k = kindOf(u), h = hostOf(u) || "새 탭";
     const split = status ? status.split_forward : "k-of-n";
@@ -309,6 +474,7 @@
       `<div><b>${esc(head[0])}</b><span>${esc(h)} · ${esc(head[1])}</span></div></div>` +
       `<div class="route">${routeSVG(k === "start" ? "endpoint" : k, h)}</div>` +
       `<div class="facts">${facts.map(([c, b, t]) => `<div class="fact ${c}"><b>${esc(b)}</b>${esc(t)}</div>`).join("")}</div>` +
+      blockedHTML(active) +
       (k === "https" || k === "http" || k === "endpoint"
         ? `<div class="pop-actions"><p class="note">${k === "endpoint" ? "조각마다 출구를 새로 고릅니다." : "이 사이트에만 다른 출구를 씁니다. 쿠키와 다른 사이트는 그대로입니다."}</p>` +
           (k === "endpoint" ? "" : `<button class="pill" id="newroute">이 사이트 새 경로</button>`) + `</div>`
@@ -393,6 +559,27 @@
       (info ? ` 홉당 평균 ${info.delay_ms}ms · 링크당 ${info.rate}패킷/초 · 분할 k=${info.split}` : "");
   }
 
+  // 루프 귀환 감시: 최근 20초 동안 보낸 루프(왕복 시간을 감안해 3초 전까지)가 돌아오지 않으면
+  // 누군가 패킷을 지연·차단(n-1 공격 등)하고 있을 수 있다.
+  const loopHist = [];
+  let alerted = 0;
+  function checkLoops(st) {
+    const now = Date.now();
+    loopHist.push({ t: now, sent: st.sent_loop, back: st.loops_back });
+    while (loopHist.length && now - loopHist[0].t > 30000) loopHist.shift();
+    const at = (ms) => loopHist.find((h) => now - h.t <= ms) || loopHist[0];
+    const a = at(23000), b = at(3000);
+    const sent = b.sent - a.sent, back = st.loops_back - at(20000).back;
+    const bad = sent >= 8 && back / sent < 0.6;
+    $("alert").hidden = !bad;
+    $("paneltoggle").classList.toggle("alarm", bad);
+    if (bad) {
+      $("alert-text").textContent = `최근 루프 패킷 ${sent}개 중 ${Math.max(0, back)}개만 돌아왔습니다. 경로상의 노드가 패킷을 ` +
+        "지연·차단하고 있을 수 있습니다 (능동 공격 또는 장애). 민감한 작업은 잠시 멈추고 새 신원을 고려하세요.";
+      if (now - alerted > 60000) { alerted = now; toast("⚠ 루프 패킷 손실 감지: 네트워크 패널을 확인하세요"); }
+    }
+  }
+
   async function poll() {
     try {
       const r = await fetch(P + "/api/status", { cache: "no-store" });
@@ -407,6 +594,7 @@
       $("k-rtt").textContent = st.loop_rtt_ms ? Math.round(st.loop_rtt_ms) : "–";
       $("k-frag").textContent = st.messages_split ? (st.fragments_sent / st.messages_split).toFixed(1) : "–";
       $("k-loop").textContent = st.sent_loop ? Math.min(100, Math.round((st.loops_back / st.sent_loop) * 100)) + "%" : "–";
+      checkLoops(st);
       $("pulse").classList.remove("off");
       setRows(status);
       renderSeg(status);

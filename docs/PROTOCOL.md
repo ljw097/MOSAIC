@@ -56,7 +56,7 @@ k_ir ‖ k_ri ‖ k_c = HKDF(DH(e_I,S_R) ‖ ss_kem ‖ DH(e_I,e_R), "MOSAIC lin
 |---|---|
 | 1 PACKET | Sphinx 패킷 |
 | 2 DELIVER | 게이트웨이 → 클라이언트: `surb_id(8) ‖ payload(2048)` |
-| 3 REGISTER | 클라이언트 → 게이트웨이: `mailbox_id(16)` |
+| 3 REGISTER | 클라이언트 → 게이트웨이: `mailbox_secret(32)`. 우편함 id = `H("MOSAIC mailbox", secret)[:16]` (id가 공개돼도 가로챌 수 없음) |
 | 4 DUMMY | 커버 |
 | 6 ENDPOINT_FRAG | 출구 → 엔드포인트 입구: 조각 하나 |
 | 5 FORWARD | 클라이언트/서비스 → 게이트웨이: `target(16) ‖ packet` (SURB 응답 대리 전송) |
@@ -103,7 +103,7 @@ FRAGMENT (Sphinx 본문, ≤2032B) = 0xF5 ‖ msg_id(16) ‖ idx(1) ‖ k(1) ‖
   `DELIVER_MAILBOX(intro mailbox)`이다. 서비스가 조각을 모아 SSMS를 풀고 E2E를 연다.
 - E2E (`mosaic/e2e.py`):
   ```
-  INIT = 0xE1 ‖ conn(16) ‖ nonce(12) ‖ e_c(32) ‖ ML-KEM ct(1088) ‖ AEAD(k_up, cell)
+  INIT = 0xE1 ‖ conn(16) ‖ nonce(12) ‖ e_c(32) ‖ ML-KEM ct(1088) ‖ AEAD(k_up, timestamp(8) ‖ cell)   # 10분 지나면 거부
   UP   = 0xE2 ‖ conn ‖ nonce ‖ AEAD(k_up, cell)      DOWN = 0xE3 ‖ conn ‖ nonce ‖ AEAD(k_down, cell)
   k_up ‖ k_down = HKDF(X25519(e_c, S) ‖ ss_kem, "MOSAIC e2e v1" ‖ conn ‖ e_c ‖ H(ct) ‖ S)
   ```
