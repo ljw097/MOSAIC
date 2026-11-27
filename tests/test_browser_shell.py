@@ -1,5 +1,7 @@
 """브라우저 셸 라우트: CSP 분리, 상태 API, 정적 파일 경로 제한, iframe 안에서는 도구 막대 생략."""
 import json
+import re
+import urllib.parse
 import urllib.error
 import urllib.request
 
@@ -96,3 +98,42 @@ def test_conn_pool_isolation():
     assert reused and got is a
     pool.drop("site:y.com")
     assert b.closed
+
+
+def test_download_prompt_and_http_approval(monkeypatch):
+    import mosaic.browser.server as BS
+    from mosaic.browser.fetcher import Response
+
+    calls = []
+
+    def fake_fetch(proxy, url, iso, jar=None, top="", method="GET", body=None, extra=None, **kw):
+        calls.append((url, kw.get("allow_insecure")))
+        if url.endswith(".pdf"):
+            return Response(200, "OK", [("Content-Type", "application/pdf")], b"%PDF-1.4 secret", url)
+        return Response(200, "OK", [("Content-Type", "text/html")], b"<title>ok</title><img src='/i.png'>", url)
+
+    monkeypatch.setattr(BS, "fetch", fake_fetch)
+    br = BrowserServer(("127.0.0.1", 1), "127.0.0.1", 17983)
+    br.start()
+    try:
+        # PDF는 바로 렌더링하지 않고 경고 페이지 → 확인 링크로만 받는다
+        st, h, body = _get(br.url + "view?u=" + urllib.parse.quote("https://ex.com/report.pdf", safe=""),
+                           {"Sec-Fetch-Dest": "iframe"})
+        text = body.decode()
+        assert "이 파일을 저장할까요?" in text and "%PDF" not in text and "report.pdf" in text
+        did = re.search(r"download\?id=([\w-]+)", text).group(1)
+        st, h, body = _get(br.url + "download?id=" + did)
+        assert body.startswith(b"%PDF") and h["Content-Disposition"].startswith("attachment")
+        assert _get(br.url + "download?id=" + did)[0] == 404            # 한 번만
+        # HTTP 허락은 사이트 단위로 기억되고, 새 신원이면 잊는다
+        http_url = "http://plain.example/a"
+        st, h, body = _get(br.url + "view?u=" + urllib.parse.quote(http_url, safe=""))
+        assert "암호화되지 않은 연결" in body.decode()
+        _get(br.url + "view?u=" + urllib.parse.quote(http_url, safe="") + "&ok=1")
+        st, h, body = _get(br.url + "view?u=" + urllib.parse.quote("http://plain.example/b", safe=""))
+        assert "<title>ok</title>" in body.decode()
+        br.new_identity()
+        st, h, body = _get(br.url + "view?u=" + urllib.parse.quote("http://plain.example/b", safe=""))
+        assert "암호화되지 않은 연결" in body.decode()
+    finally:
+        br.stop()

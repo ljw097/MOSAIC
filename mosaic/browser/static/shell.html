@@ -33,7 +33,9 @@
 
     <form class="omnibox" id="omnibox" autocomplete="off">
       <button type="button" class="chip start" id="chip" aria-haspopup="dialog"></button>
-      <input id="addr" type="text" spellcheck="false" placeholder="검색하거나 주소 입력 (예: example.com, ….mosaic)" aria-label="주소">
+      <input id="addr" type="text" spellcheck="false" placeholder="검색하거나 주소 입력 (예: example.com, ….mosaic)" aria-label="주소"
+             role="combobox" aria-controls="suggest" aria-autocomplete="list">
+      <div class="suggest" id="suggest" role="listbox"></div>
     </form>
 
     <button class="pill" id="newid" title="쿠키 삭제 + 모든 사이트에 새 출구">
@@ -48,10 +50,11 @@
   <div class="progress" id="progress"></div>
 
   <div class="main">
-    <div class="frames" id="frames"></div>
+    <div class="frames" id="frames"><div class="statusbar" id="status" aria-live="polite"></div></div>
     <aside class="drawer" id="drawer" aria-label="네트워크 상태">
       <div class="drawer-inner">
         <h2><span class="pulse" id="pulse"></span>믹스넷 연결</h2>
+        <div class="card alert" id="alert" hidden><h3>⚠ 능동 공격 의심</h3><p class="note" id="alert-text"></p></div>
         <div class="card">
           <h3>보안 수준</h3>
           <div class="seg" id="seg" role="radiogroup" aria-label="보안 수준"></div>
