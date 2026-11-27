@@ -196,9 +196,9 @@ def main(argv=None):
     c.set_defaults(fn=cmd_client)
 
     t = sub.add_parser("testnet", help="로컬 테스트망 + 클라이언트 + 브라우저를 한 번에 실행")
-    t.add_argument("--base-port", type=int, default=47000)
-    t.add_argument("--gateways", type=int, default=2)
-    t.add_argument("--mixes", type=int, default=2, help="계층당 믹스 수")
+    t.add_argument("--base-port", type=int, default=17000)
+    t.add_argument("--gateways", type=int, default=3)
+    t.add_argument("--mixes", type=int, default=4, help="계층당 믹스 수 (마름모 폭 이상 권장)")
     t.add_argument("--exits", type=int, default=2)
     t.add_argument("--allow-private", action="store_true")
     t.add_argument("--upstream-proxy", default=None)

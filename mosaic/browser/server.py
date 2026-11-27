@@ -206,7 +206,9 @@ class Handler(BaseHTTPRequestHandler):
         if c is not None:
             st = dict(c.stats)
             st["profile"] = c.profile.name
-            st["gateway"] = c.gateway.node_id.hex()[:16] if c.gateway else "-"
+            st["gateways"] = ", ".join(l.gateway.node_id.hex()[:12] for l in c.lanes) or "-"
+            st["split_forward"] = f"k∈{c.profile.split_k}, n=k+{c.profile.split_extra}"
+            st["split_reply"] = f"{c.profile.reply_k}-of-{c.profile.reply_n}"
             st["nodes_in_consensus"] = len(c.consensus.nodes) if c.consensus else 0
             st["open_streams"] = len(c.streams)
             rows = "".join(f"<tr><td>{html.escape(str(k))}</td><td>{html.escape(str(v))}</td></tr>" for k, v in st.items())

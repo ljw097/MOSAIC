@@ -1,7 +1,9 @@
 """MOSAIC 출구 서비스: 믹스넷과 일반 인터넷 사이의 다리.
 
+- 출구는 마름모(◇)의 오른쪽 꼭짓점이다. 서로 다른 경로로 들어온 조각을 k개 모아 메시지를 복원한다.
+- 응답은 클라이언트가 건넨 SURB 묶음으로 보낸다. 한 묶음은 경로가 서로 겹치지 않는 SURB n개이고,
+  응답 하나를 k-of-n으로 쪼개 묶음 안의 SURB에 하나씩 싣는다. 응답 방향도 마름모가 된다.
 - 출구는 목적지(host:port)와 바이트 흐름을 본다. 하지만 누가 보냈는지는 모른다.
-  답장은 클라이언트가 미리 건넨 SURB로만 보낼 수 있다.
 - DNS 조회는 출구에서 한다. 클라이언트 쪽에서 DNS가 새어 나가지 않는다.
 - 내용의 기밀성은 종단 간 TLS가 맡는다 (브라우저는 HTTPS를 우선 사용한다).
 - 기본 출구 정책은 사설·루프백·링크로컬 주소와 SMTP 포트를 막는다.
@@ -17,6 +19,7 @@ import time
 
 from . import cells as K
 from . import sphinx as S
+from . import split as P
 
 log = logging.getLogger("mosaic.exit")
 SESSION_IDLE = 300
@@ -26,8 +29,9 @@ MAX_UP_BUFFER = 512
 class Session:
     def __init__(self, sid: bytes):
         self.sid = sid
-        self.surbs: list[S.SURB] = []
+        self.surb_sets: list[list[S.SURB]] = []
         self.surb_event = asyncio.Event()
+        self.reply_k = 2
         self.next_up = 0
         self.pending: dict[int, K.Cell] = {}
         self.next_down = 0
@@ -49,6 +53,7 @@ class ExitService:
         self.upstream_proxy = upstream_proxy
         self.sessions: dict[bytes, Session] = {}
         self.closed_ids: dict[bytes, float] = {}
+        self.reasm = P.Reassembler()
         self._gc = None
 
     def policy(self) -> dict:
@@ -62,10 +67,22 @@ class ExitService:
     def on_payload(self, payload: bytes):
         try:
             body = S.check_integrity(payload)
-            cell = K.Cell.unpack(body)
-        except (S.SphinxError, ValueError) as e:
+        except S.SphinxError as e:
             log.debug("bad exit payload: %s", e)
             return
+        frag = P.parse(body)
+        if frag is None:
+            return          # 분할되지 않은 페이로드 = 드롭 커버
+        msg = self.reasm.add(frag)
+        if msg is None:
+            return
+        try:
+            cell = K.Cell.unpack(msg)
+        except ValueError:
+            return
+        self.on_cell(cell)
+
+    def on_cell(self, cell: K.Cell):
         if cell.type == K.C_DROP:
             return
         if self._gc is None:
@@ -89,7 +106,7 @@ class ExitService:
     def _handle(self, s: Session, c: K.Cell):
         if c.type == K.C_SURBS:
             try:
-                s.surbs.extend(K.unpack_surbs(c.data))
+                s.surb_sets.extend(K.unpack_surb_sets(c.data))
             except Exception:     # noqa: BLE001
                 return
             s.surb_event.set()
@@ -116,13 +133,13 @@ class ExitService:
             return False
         if self.allow_private:
             return True
-        ip = ipaddress.ip_address(addr)
-        return ip.is_global
+        return ipaddress.ip_address(addr).is_global
 
     async def _open(self, s: Session, data: bytes):
         try:
             req = json.loads(data)
             host, port = str(req["host"]), int(req["port"])
+            s.reply_k = max(1, min(int(req.get("reply_k", 2)), P.MAX_N))
             if self.upstream_proxy:
                 r, w = await self._via_proxy(host, port)
             else:
@@ -133,14 +150,14 @@ class ExitService:
                 r, w = await asyncio.wait_for(asyncio.open_connection(addr, port), 20)
         except Exception as e:     # noqa: BLE001
             log.info("exit open failed: %s", e)
-            await self._reply(s, K.D_ERROR, str(e)[:200].encode(), reserve=False)
+            await self._reply(s, K.D_ERROR, str(e)[:200].encode())
             self._teardown(s)
             return
         s.writer = w
         if s.pending_data:
             w.write(s.pending_data)
             s.pending_data = b""
-        await self._reply(s, K.D_CONNECTED, b"", reserve=False)
+        await self._reply(s, K.D_CONNECTED, b"")
         if s.close_after_connect:
             w.write_eof()
         s.reader_task = asyncio.create_task(self._pump(s, r))
@@ -164,32 +181,35 @@ class ExitService:
     async def _pump(self, s: Session, r: asyncio.StreamReader):
         try:
             while True:
-                while len(s.surbs) <= 1:    # 마지막 SURB 한 개는 CLOSE용으로 남긴다
+                while len(s.surb_sets) <= 1:    # 마지막 묶음 하나는 CLOSE용으로 남긴다
                     s.surb_event.clear()
                     await asyncio.wait_for(s.surb_event.wait(), SESSION_IDLE)
-                data = await r.read(K.DATA_MAX)
+                data = await r.read(K.data_max(s.reply_k))
                 if not data:
                     break
                 s.last = time.time()
                 await self._reply(s, K.D_DATA, data)
         except Exception:      # noqa: BLE001
             pass
-        await self._reply(s, K.D_CLOSE, b"", reserve=False)
+        await self._reply(s, K.D_CLOSE, b"")
         self._teardown(s)
 
-    async def _reply(self, s: Session, t: int, data: bytes, reserve: bool = True):
+    async def _reply(self, s: Session, t: int, data: bytes):
         deadline = time.time() + 30
-        while not s.surbs:
+        while not s.surb_sets:
             s.surb_event.clear()
             try:
                 await asyncio.wait_for(s.surb_event.wait(), max(0.01, deadline - time.time()))
             except asyncio.TimeoutError:
                 return
-        surb = s.surbs.pop(0)
+        surb_set = s.surb_sets.pop(0)
         cell = K.Cell(t, s.sid, s.next_down, data)
         s.next_down += 1
-        first, pkt = S.use_surb(surb, cell.pack())
-        await self.node.send_packet(first, pkt)
+        k = min(s.reply_k, len(surb_set))
+        # 응답도 k-of-n 분할: 조각 i는 SURB i (서로 다른 경로)로 → 마름모 응답 경로
+        for frag, surb in zip(P.split(cell.pack(), k, len(surb_set)), surb_set):
+            first, pkt = S.use_surb(surb, frag.pack())
+            await self.node.send_packet(first, pkt)
 
     def _teardown(self, s: Session):
         if s.closed:
@@ -207,6 +227,7 @@ class ExitService:
         while True:
             await asyncio.sleep(30)
             now = time.time()
+            self.reasm.gc()
             self.closed_ids = {k: t for k, t in self.closed_ids.items() if now - t < 3600}
             for s in list(self.sessions.values()):
                 if now - s.last > SESSION_IDLE:

@@ -40,7 +40,7 @@ def test_end_to_end():
     async def run():
         es = await asyncio.start_server(echo, "127.0.0.1", 0)
         eport = es.sockets[0].getsockname()[1]
-        tn = await start_testnet(base_port=47300, allow_private=True)
+        tn = await start_testnet(base_port=17300, allow_private=True, mixes_per_layer=2, gateways=2)
         c = MosaicClient(tn.authority_specs, 2)
         await c.start()
         try:
@@ -55,9 +55,9 @@ def test_end_to_end():
             st.close()
 
             # 2) SOCKS5 + 브라우저 (HTTP, 정화)
-            socks = SocksServer(c, "127.0.0.1", 47390)
+            socks = SocksServer(c, "127.0.0.1", 17390)
             await socks.start()
-            br = BrowserServer(("127.0.0.1", 47390), "127.0.0.1", 47391, c, asyncio.get_running_loop())
+            br = BrowserServer(("127.0.0.1", 17390), "127.0.0.1", 17391, c, asyncio.get_running_loop())
             br.start()
             url = br.url + "view?u=" + urllib.parse.quote(f"http://127.0.0.1:{wport}/", safe="")
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -74,7 +74,7 @@ def test_end_to_end():
             assert c.stats["sent_cover"] > 0 and c.stats["recv_dummy"] > 0
             assert c.stats["loops_back"] > 0
             # 출구는 클라이언트의 우편함 id를 본 적이 없다 (세션 id만 앎)
-            assert all(c.mailbox not in s.sid for n in tn.nodes if n.exit_service
+            assert all(l.mailbox not in s.sid for l in c.lanes for n in tn.nodes if n.exit_service
                        for s in n.exit_service.sessions.values())
             br.stop()
         finally:
